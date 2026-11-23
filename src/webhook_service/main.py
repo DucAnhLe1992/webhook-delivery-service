@@ -1,24 +1,24 @@
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from importlib.metadata import version
 
-import httpx2
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import OperationalError
 
 from webhook_service.api import deliveries
-from webhook_service.config import get_settings
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    settings = get_settings()
-    # One shared client reuses connections. Redirects are not followed: the destination is fixed.
-    with httpx2.Client(timeout=settings.delivery_timeout_seconds, follow_redirects=False) as client:
-        app.state.http_client = client
-        yield
-
-
-app = FastAPI(title="Webhook Delivery Service", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Webhook Delivery Service", version=version("webhook-delivery-service"))
 app.include_router(deliveries.router)
+
+
+@app.exception_handler(OperationalError)
+def storage_unavailable(request: Request, exc: OperationalError) -> JSONResponse:
+    # The database could not be reached, so the delivery was not accepted. Never answer
+    # 202 in this case; tell the producer to try again instead.
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": "Storage is unavailable; the delivery was not accepted. Retry later."},
+        headers={"Retry-After": "5"},
+    )
 
 
 @app.get("/health")

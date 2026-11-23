@@ -1,6 +1,6 @@
 [project]
 name = "webhook-delivery-service"
-version = "0.1.0"
+version = "0.2.0"
 description = "Accepts events from producer apps and delivers them as webhooks to a configured receiver."
 readme = "README.md"
 authors = [
@@ -8,9 +8,12 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.20.1",
     "fastapi>=0.165.0",
     "httpx2>=2.16.2",
+    "psycopg[binary]>=3.3.9",
     "pydantic-settings>=2.16.3",
+    "sqlalchemy>=2.1.9",
     "uvicorn[standard]>=0.54.0",
 ]
 
@@ -23,13 +26,15 @@ module-name = "webhook_service"
 
 [tool.ruff]
 line-length = 100
+# First-party code lives in src/; otherwise the local alembic/ folder shadows the alembic package.
+src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "SIM", "FAST"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra --import-mode=importlib"
 
 [dependency-groups]
 dev = [

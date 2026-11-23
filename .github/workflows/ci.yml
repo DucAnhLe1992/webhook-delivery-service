@@ -8,10 +8,28 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: webhooks
+          POSTGRES_PASSWORD: webhooks
+          POSTGRES_DB: webhooks
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U webhooks -d webhooks"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+      - name: Migrations apply and match the models
+        run: |
+          uv run alembic upgrade head
+          uv run alembic check
       - run: uv run pytest

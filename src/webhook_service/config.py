@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import HttpUrl, PositiveFloat
+from pydantic import HttpUrl, PositiveFloat, PostgresDsn
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -8,6 +8,10 @@ class Settings(BaseSettings):
     """Read from environment variables (or a local .env file), e.g. RECEIVER_URL."""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    database_url: PostgresDsn = PostgresDsn(
+        "postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks"
+    )
 
     # The only destination. Producers never choose where a webhook goes, which keeps
     # the service from being used to make requests to arbitrary addresses (SSRF).
