@@ -1,76 +1,182 @@
+import hashlib
+import json
 import uuid
 from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import func, select, update
-from sqlalchemy.orm import Session
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session, selectinload
 
-from webhook_service.models import Delivery, DeliveryStatus
-from webhook_service.sender import AttemptOutcome, AttemptResult
-
-
-def create_delivery(session: Session, *, event_type: str, data: dict[str, Any]) -> Delivery:
-    delivery = Delivery(event_type=event_type, payload=data)
-    session.add(delivery)
-    # Commit before the API answers 202: "accepted" must mean "stored".
-    session.commit()
-    return delivery
+from webhook_service.models import Delivery, DeliveryAttempt, DeliveryStatus
+from webhook_service.sender import AttemptOutcome, AttemptResult, ErrorCategory
 
 
-def get_delivery(session: Session, delivery_id: uuid.UUID) -> Delivery | None:
-    return session.get(Delivery, delivery_id)
+class IdempotencyKeyReused(Exception):
+    """The Idempotency-Key was already used for a request with different content."""
 
 
-def claim_next_due(session: Session) -> Delivery | None:
-    """Mark the oldest due pending delivery as processing and return it, or None.
-
-    One atomic statement:
-
-        UPDATE deliveries SET status = 'processing'
-        WHERE id = (SELECT id FROM deliveries
-                    WHERE status = 'pending' AND next_attempt_at <= now()
-                    ORDER BY next_attempt_at LIMIT 1)
-          AND status = 'pending'
-        RETURNING *
-    """
-    oldest_due = (
-        select(Delivery.id)
-        .where(Delivery.status == DeliveryStatus.PENDING, Delivery.next_attempt_at <= func.now())
-        .order_by(Delivery.next_attempt_at)
-        .limit(1)
-        .scalar_subquery()
+def request_fingerprint(event_type: str, data: dict[str, Any]) -> str:
+    """A hash of the request's content. The order of keys in `data` does not matter."""
+    canonical = json.dumps(
+        {"event_type": event_type, "data": data}, sort_keys=True, separators=(",", ":")
     )
-    delivery = session.scalars(
-        update(Delivery)
-        # The second status check runs again if another worker updated the row first,
-        # so two workers can never claim the same delivery.
-        .where(Delivery.id == oldest_due, Delivery.status == DeliveryStatus.PENDING)
-        .values(status=DeliveryStatus.PROCESSING)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def create_delivery(
+    session: Session,
+    *,
+    event_type: str,
+    data: dict[str, Any],
+    idempotency_key: str | None = None,
+) -> tuple[Delivery, bool]:
+    """Store a new delivery and return it with created=True.
+
+    If the idempotency key was used before, return the original delivery with
+    created=False instead, or raise IdempotencyKeyReused if the content differs.
+    Either way the result is committed before the API answers: "accepted" means "stored".
+    """
+    if idempotency_key is None:
+        delivery = Delivery(event_type=event_type, payload=data)
+        session.add(delivery)
+        session.commit()
+        return delivery, True
+
+    fingerprint = request_fingerprint(event_type, data)
+    # If a request with the same key is being stored at this moment, PostgreSQL waits for
+    # it to finish and then skips this insert, instead of failing on the unique key.
+    inserted = session.scalars(
+        insert(Delivery)
+        .values(
+            event_type=event_type,
+            payload=data,
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
+        )
+        .on_conflict_do_nothing(index_elements=[Delivery.idempotency_key])
         .returning(Delivery)
     ).one_or_none()
     session.commit()
-    return delivery
+    if inserted is not None:
+        return inserted, True
+
+    original = session.scalars(
+        select(Delivery).where(Delivery.idempotency_key == idempotency_key)
+    ).one()
+    if original.request_fingerprint != fingerprint:
+        raise IdempotencyKeyReused(idempotency_key)
+    return original, False
+
+
+def get_delivery(session: Session, delivery_id: uuid.UUID) -> Delivery | None:
+    return session.get(Delivery, delivery_id, options=[selectinload(Delivery.attempts)])
+
+
+def claim_next_due(
+    session: Session, *, claim_timeout: timedelta, max_attempts: int
+) -> Delivery | None:
+    """Claim the next due delivery for one attempt, or return None if nothing is due.
+
+    A delivery is due when it is pending and its next_attempt_at has passed, or when it is
+    processing but its claim expired: the worker that held it stopped or hung before
+    saving a result.
+
+    FOR UPDATE SKIP LOCKED lets several workers claim at the same time: a row that another
+    worker is claiming right now is skipped instead of waited for.
+    """
+    while True:
+        delivery = session.scalars(
+            select(Delivery)
+            .where(
+                Delivery.status.in_([DeliveryStatus.PENDING, DeliveryStatus.PROCESSING]),
+                Delivery.next_attempt_at <= func.now(),
+            )
+            .order_by(Delivery.next_attempt_at)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        ).one_or_none()
+        if delivery is None:
+            return None
+
+        if delivery.status == DeliveryStatus.PROCESSING:
+            close_expired_attempt(session, delivery.claim_token)
+            if delivery.attempt_count >= max_attempts:
+                # Attempts are counted when claimed, not when their result is saved, so a
+                # delivery that crashes every worker that sends it still runs out of attempts.
+                delivery.status = DeliveryStatus.FAILED
+                delivery.claim_token = None
+                session.commit()
+                continue
+
+        attempt = DeliveryAttempt(
+            id=uuid.uuid4(), delivery_id=delivery.id, number=delivery.attempt_count + 1
+        )
+        session.add(attempt)
+        delivery.status = DeliveryStatus.PROCESSING
+        delivery.claim_token = attempt.id
+        delivery.attempt_count = attempt.number
+        delivery.next_attempt_at = func.now() + claim_timeout
+        session.commit()
+        return delivery
+
+
+def close_expired_attempt(session: Session, attempt_id: uuid.UUID | None) -> None:
+    session.execute(
+        update(DeliveryAttempt)
+        .where(DeliveryAttempt.id == attempt_id)
+        .values(
+            finished_at=func.now(),
+            outcome=AttemptOutcome.RETRYABLE_FAILURE,
+            error_category=ErrorCategory.CLAIM_EXPIRED,
+        )
+    )
 
 
 def record_attempt(
-    session: Session, delivery_id: uuid.UUID, result: AttemptResult, *, retry_delay: timedelta
-) -> None:
-    """Store the outcome of one attempt on a delivery that was claimed for processing."""
-    if result.outcome is AttemptOutcome.DELIVERED:
-        changes: dict[str, Any] = {"status": DeliveryStatus.DELIVERED}
-    elif result.outcome is AttemptOutcome.RETRYABLE_FAILURE:
-        changes = {"status": DeliveryStatus.PENDING, "next_attempt_at": func.now() + retry_delay}
-    else:
-        changes = {"status": DeliveryStatus.FAILED}
+    session: Session,
+    delivery_id: uuid.UUID,
+    claim_token: uuid.UUID,
+    result: AttemptResult,
+    *,
+    retry_delay: timedelta,
+    max_attempts: int,
+) -> DeliveryStatus | None:
+    """Save the result of the attempt that holds the claim and return the new status.
+
+    Returns None and changes nothing if this attempt lost the claim: it expired and
+    another worker took over the delivery. Only the current claim holder may write.
+    """
+    delivery = session.scalars(
+        select(Delivery)
+        .where(Delivery.id == delivery_id, Delivery.claim_token == claim_token)
+        .with_for_update()
+    ).one_or_none()
+    if delivery is None:
+        return None
 
     session.execute(
-        update(Delivery)
-        .where(Delivery.id == delivery_id, Delivery.status == DeliveryStatus.PROCESSING)
+        update(DeliveryAttempt)
+        .where(DeliveryAttempt.id == claim_token)
         .values(
-            attempt_count=Delivery.attempt_count + 1,
-            last_http_status=result.http_status,
-            last_error_category=result.error_category,
-            **changes,
+            finished_at=func.now(),
+            outcome=result.outcome,
+            http_status=result.http_status,
+            error_category=result.error_category,
+            duration_ms=result.duration_ms,
         )
     )
+    if result.outcome is AttemptOutcome.DELIVERED:
+        delivery.status = DeliveryStatus.DELIVERED
+    elif (
+        result.outcome is AttemptOutcome.RETRYABLE_FAILURE and delivery.attempt_count < max_attempts
+    ):
+        delivery.status = DeliveryStatus.PENDING
+        delivery.next_attempt_at = func.now() + retry_delay
+    else:
+        delivery.status = DeliveryStatus.FAILED
+    delivery.claim_token = None
+    delivery.last_http_status = result.http_status
+    delivery.last_error_category = result.error_category
     session.commit()
+    return DeliveryStatus(delivery.status)

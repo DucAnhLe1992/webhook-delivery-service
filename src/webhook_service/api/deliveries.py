@@ -1,7 +1,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from webhook_service.db import get_session
@@ -16,13 +16,38 @@ SessionDep = Annotated[Session, Depends(get_session)]
 
 # These are plain `def` functions, not `async def`: FastAPI runs them in a thread pool,
 # so the blocking database calls do not stall other requests.
-@router.post("", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "",
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        status.HTTP_409_CONFLICT: {
+            "description": "The Idempotency-Key was already used for a different request"
+        }
+    },
+)
 def submit_delivery(
-    body: DeliveryRequest, response: Response, session: SessionDep
+    body: DeliveryRequest,
+    response: Response,
+    session: SessionDep,
+    idempotency_key: Annotated[str | None, Header(min_length=1, max_length=255)] = None,
 ) -> DeliveryAccepted:
-    """Store an event for delivery. 202 means it is saved in the database, not yet sent."""
-    delivery = delivery_service.create_delivery(session, event_type=body.event_type, data=body.data)
+    """Store an event for delivery. 202 means it is saved in the database, not yet sent.
+
+    With an Idempotency-Key header, repeating the request returns the original delivery
+    (marked with Idempotent-Replayed: true) instead of storing it twice.
+    """
+    try:
+        delivery, created = delivery_service.create_delivery(
+            session, event_type=body.event_type, data=body.data, idempotency_key=idempotency_key
+        )
+    except delivery_service.IdempotencyKeyReused:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="This Idempotency-Key was already used for a different request",
+        ) from None
     response.headers["Location"] = f"/deliveries/{delivery.id}"
+    if not created:
+        response.headers["Idempotent-Replayed"] = "true"
     return DeliveryAccepted(delivery_id=delivery.id, status=DeliveryStatus(delivery.status))
 
 

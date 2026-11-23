@@ -1,5 +1,6 @@
 import os
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -59,7 +60,7 @@ def engine() -> Iterator[Engine]:
 def db(engine: Engine) -> Engine:
     """The test database, emptied before each test."""
     with engine.begin() as connection:
-        connection.execute(text("TRUNCATE deliveries"))
+        connection.execute(text("TRUNCATE deliveries, delivery_attempts"))
     return engine
 
 
@@ -74,3 +75,25 @@ def client(db: Engine) -> Iterator[TestClient]:
     app.dependency_overrides[get_session] = test_session
     yield TestClient(app)
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def wait_until_blocked(db: Engine) -> Callable[[], None]:
+    """Return a function that waits until a query is blocked by another transaction's lock."""
+
+    def wait(timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        with db.connect().execution_options(isolation_level="AUTOCOMMIT") as observer:
+            while time.monotonic() < deadline:
+                waiting = observer.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE wait_event_type = 'Lock' AND datname = current_database()"
+                    )
+                )
+                if waiting:
+                    return
+                time.sleep(0.01)
+        raise AssertionError("no query started waiting for a lock")
+
+    return wait

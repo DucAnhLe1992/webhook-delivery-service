@@ -5,7 +5,7 @@ from typing import Any, Self
 from pydantic import BaseModel, ConfigDict, Field
 
 from webhook_service.models import Delivery, DeliveryStatus
-from webhook_service.sender import ErrorCategory
+from webhook_service.sender import AttemptOutcome, ErrorCategory
 
 
 class DeliveryRequest(BaseModel):
@@ -27,6 +27,19 @@ class DeliveryAccepted(BaseModel):
     status: DeliveryStatus
 
 
+class AttemptDetail(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    number: int
+    started_at: datetime
+    # Both None while the attempt is still in progress.
+    finished_at: datetime | None
+    outcome: AttemptOutcome | None
+    http_status: int | None
+    error_category: ErrorCategory | None
+    duration_ms: int | None
+
+
 class DeliveryDetail(BaseModel):
     delivery_id: uuid.UUID
     event_type: str
@@ -38,6 +51,7 @@ class DeliveryDetail(BaseModel):
     next_attempt_at: datetime
     created_at: datetime
     updated_at: datetime
+    attempts: list[AttemptDetail]
 
     @classmethod
     def from_model(cls, delivery: Delivery) -> Self:
@@ -52,6 +66,7 @@ class DeliveryDetail(BaseModel):
             next_attempt_at=delivery.next_attempt_at,
             created_at=delivery.created_at,
             updated_at=delivery.updated_at,
+            attempts=[AttemptDetail.model_validate(attempt) for attempt in delivery.attempts],
         )
 
 

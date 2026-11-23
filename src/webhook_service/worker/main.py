@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session
 
 from webhook_service.config import Settings, get_settings
 from webhook_service.db import get_engine
+from webhook_service.models import DeliveryStatus
+from webhook_service.retry import backoff_delay
 from webhook_service.schemas import WebhookMessage
 from webhook_service.sender import AttemptOutcome, AttemptResult, send_webhook
 from webhook_service.services import delivery_service
@@ -26,9 +28,15 @@ log = logging.getLogger("worker")
 def process_one(engine: Engine, client: httpx2.Client, settings: Settings) -> bool:
     """Claim, send and record one due delivery. Returns False if nothing was due."""
     with Session(engine, expire_on_commit=False) as session:
-        delivery = delivery_service.claim_next_due(session)
+        delivery = delivery_service.claim_next_due(
+            session,
+            claim_timeout=timedelta(seconds=settings.claim_timeout_seconds),
+            max_attempts=settings.max_attempts,
+        )
     if delivery is None:
         return False
+    attempt, claim_token = delivery.attempt_count, delivery.claim_token
+    assert claim_token is not None
 
     # The claim is committed, so no transaction is held open while the receiver answers.
     message = WebhookMessage(
@@ -38,20 +46,41 @@ def process_one(engine: Engine, client: httpx2.Client, settings: Settings) -> bo
         client, str(settings.receiver_url), str(delivery.id), message.model_dump(mode="json")
     )
 
-    retry_delay = timedelta(seconds=settings.retry_delay_seconds)
+    retry_delay = backoff_delay(
+        attempt,
+        base_seconds=settings.retry_base_delay_seconds,
+        max_seconds=settings.retry_max_delay_seconds,
+    )
     with Session(engine, expire_on_commit=False) as session:
-        delivery_service.record_attempt(session, delivery.id, result, retry_delay=retry_delay)
+        status = delivery_service.record_attempt(
+            session,
+            delivery.id,
+            claim_token,
+            result,
+            retry_delay=retry_delay,
+            max_attempts=settings.max_attempts,
+        )
 
-    log.info("%s %s", delivery.id, describe(result, retry_delay))
+    if status is None:
+        log.warning(
+            "%s attempt %d: the claim expired before the result was saved; "
+            "another worker has taken over",
+            delivery.id,
+            attempt,
+        )
+    else:
+        log.info("%s attempt %d: %s", delivery.id, attempt, describe(result, status, retry_delay))
     return True
 
 
-def describe(result: AttemptResult, retry_delay: timedelta) -> str:
+def describe(result: AttemptResult, status: DeliveryStatus, retry_delay: timedelta) -> str:
     answer = f"HTTP {result.http_status}" if result.http_status else result.error_category
-    if result.outcome is AttemptOutcome.DELIVERED:
+    if status is DeliveryStatus.DELIVERED:
         return f"delivered ({answer}, {result.duration_ms} ms)"
-    if result.outcome is AttemptOutcome.RETRYABLE_FAILURE:
+    if status is DeliveryStatus.PENDING:
         return f"failed ({answer}), retrying in {retry_delay.total_seconds():.0f}s"
+    if result.outcome is AttemptOutcome.RETRYABLE_FAILURE:
+        return f"failed ({answer}), no attempts left"
     return f"failed permanently ({answer})"
 
 
