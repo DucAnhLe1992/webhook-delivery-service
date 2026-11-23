@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     receiver_url: HttpUrl = HttpUrl("http://127.0.0.1:9000/webhooks")
     delivery_timeout_seconds: PositiveFloat = 5.0
 
+    # Worker: how long to wait before retrying a retryable failure, and how often to
+    # look for due deliveries when there is nothing to do.
+    retry_delay_seconds: PositiveFloat = 10.0
+    poll_interval_seconds: PositiveFloat = 1.0
+
 
 @lru_cache
 def get_settings() -> Settings:

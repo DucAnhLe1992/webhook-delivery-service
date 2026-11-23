@@ -5,6 +5,7 @@ from typing import Any, Self
 from pydantic import BaseModel, ConfigDict, Field
 
 from webhook_service.models import Delivery, DeliveryStatus
+from webhook_service.sender import ErrorCategory
 
 
 class DeliveryRequest(BaseModel):
@@ -32,6 +33,9 @@ class DeliveryDetail(BaseModel):
     data: dict[str, Any]
     status: DeliveryStatus
     attempt_count: int
+    last_http_status: int | None
+    last_error_category: ErrorCategory | None
+    next_attempt_at: datetime
     created_at: datetime
     updated_at: datetime
 
@@ -43,6 +47,9 @@ class DeliveryDetail(BaseModel):
             data=delivery.payload,
             status=DeliveryStatus(delivery.status),
             attempt_count=delivery.attempt_count,
+            last_http_status=delivery.last_http_status,
+            last_error_category=delivery.last_error_category,
+            next_attempt_at=delivery.next_attempt_at,
             created_at=delivery.created_at,
             updated_at=delivery.updated_at,
         )

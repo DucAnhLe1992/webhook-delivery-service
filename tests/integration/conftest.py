@@ -56,13 +56,19 @@ def engine() -> Iterator[Engine]:
 
 
 @pytest.fixture
-def client(engine: Engine) -> Iterator[TestClient]:
-    """An API client that uses an emptied test database."""
+def db(engine: Engine) -> Engine:
+    """The test database, emptied before each test."""
     with engine.begin() as connection:
         connection.execute(text("TRUNCATE deliveries"))
+    return engine
+
+
+@pytest.fixture
+def client(db: Engine) -> Iterator[TestClient]:
+    """An API client that uses the emptied test database."""
 
     def test_session() -> Iterator[Session]:
-        with Session(engine, expire_on_commit=False) as session:
+        with Session(db, expire_on_commit=False) as session:
             yield session
 
     app.dependency_overrides[get_session] = test_session

@@ -11,28 +11,48 @@ Stack: Python 3.12+, FastAPI, Pydantic, PostgreSQL, SQLAlchemy, Alembic,
 [HTTPX2](https://github.com/pydantic/httpx2) (the maintained continuation of HTTPX), pytest, Ruff
 and uv.
 
-> **Status: milestone 2 of 5.** Events are saved in PostgreSQL before the API answers. Nothing
-> sends them yet: deliveries stay `pending` until the worker arrives in milestone 3.
+> **Status: milestone 3 of 5.** A separate worker sends stored deliveries and records the
+> results. Retries use a fixed delay with no limit yet, and a worker that crashes mid-send leaves
+> its delivery stuck; milestone 4 fixes both.
 
 ## How it works today
 
 ```text
-producer ── POST /deliveries ──────▶ API ── INSERT + COMMIT ──▶ PostgreSQL
-         ◀── 202 Accepted ─────────
-producer ── GET /deliveries/{id} ──▶ API ── SELECT ───────────▶ PostgreSQL
+producer ── POST /deliveries ──▶ API ── INSERT + COMMIT ──▶ PostgreSQL
+         ◀── 202 Accepted ──────                                ▲
+                                                 claim, record  │
+                                                                ▼
+                                   receiver ◀── POST /webhooks ── worker
 ```
 
-1. The API validates `{event_type, data}` and rejects unknown fields.
-2. It inserts a `pending` row into `deliveries` and commits.
-3. Only then does it answer `202 Accepted`, with the delivery ID and a `Location` header.
+The API stores each event as a `pending` delivery and answers `202`. The worker, a separate
+process, repeats four steps:
+
+1. **Claim.** One `UPDATE` marks the oldest due `pending` delivery `processing` and returns it.
+2. **Send.** It posts the webhook. No database transaction is open while it waits.
+3. **Record.** It adds 1 to `attempt_count`, stores the HTTP status or error, and sets the state:
+   `delivered`; back to `pending` with `next_attempt_at` moved `RETRY_DELAY_SECONDS` ahead; or
+   `failed`.
+4. **Wait.** If nothing was due, it sleeps `POLL_INTERVAL_SECONDS` and looks again.
 
 ### Guarantees
 
-- `202` means the delivery is committed to PostgreSQL, so it survives an API restart.
-- If the database is unreachable, the API answers `503` with `Retry-After`, never `202`.
-- **Not yet:** sending (milestone 3). Duplicate protection: if the `202` is lost on its way back
-  and the producer sends the event again, it is stored twice (milestone 4 adds
-  `Idempotency-Key`).
+- `202` means the delivery is committed to PostgreSQL, so it survives an API restart. If the
+  database is unreachable, the API answers `503` with `Retry-After`, never `202`.
+- Each accepted delivery is attempted until it is delivered or fails permanently. Retryable
+  failures are tried again every `RETRY_DELAY_SECONDS`.
+- **At least once, not exactly once.** If the receiver processes an event but its answer is lost,
+  the worker sends it again. Every attempt carries the same `webhook-id`, so receivers can drop
+  duplicates.
+- The API and the worker are independent. Either can stop; deliveries wait in the database.
+- Two workers never claim the same delivery (a test covers this race).
+- Ctrl+C or `SIGTERM` stops the worker after it finishes the current delivery.
+- **Not yet (milestone 4):**
+  - A worker that is killed mid-send (crash, `kill -9`, power loss) leaves its delivery in
+    `processing` forever.
+  - Retries never stop and never slow down.
+  - Only the last attempt's result is kept.
+  - A producer that sends the same event twice gets two deliveries.
 
 ### Delivery states
 
@@ -43,10 +63,9 @@ pending ──▶ processing ──▶ delivered
                 └────────▶ failed
 ```
 
-The database only allows these four states. Only `pending` is used so far; the worker will move
-deliveries through the rest.
+The database only allows these four states.
 
-### Webhook format and retry rules (from milestone 3)
+### Webhook format and retry rules
 
 Webhooks follow the [Standard Webhooks](https://www.standardwebhooks.com) spec:
 
@@ -59,17 +78,16 @@ webhook-timestamp: 1795467600
 {"type":"booking.confirmed","timestamp":"2026-11-23T21:00:00Z","data":{"booking_id":42}}
 ```
 
-- `webhook-id` is the delivery ID. Receivers should use it to ignore duplicates.
+- `webhook-id` is the delivery ID, the same on every attempt. Receivers should use it to ignore
+  duplicates.
 - `webhook-timestamp` is when this attempt was sent. The body's `timestamp` is when the event
-  happened.
+  was accepted.
 
-`sender.py` classifies each attempt:
-
-| Receiver result | Outcome |
-|---|---|
-| 2xx | `delivered` |
-| 5xx, 408 or 429; connection refused or dropped; no answer in time | `retryable_failure` |
-| Other 4xx, or a 3xx redirect (never followed) | `permanent_failure` |
+| Receiver result | Outcome | New state |
+|---|---|---|
+| 2xx | `delivered` | `delivered` |
+| 5xx, 408 or 429; connection refused or dropped; no answer in time | `retryable_failure` | `pending` |
+| Other 4xx, or a 3xx redirect (never followed) | `permanent_failure` | `failed` |
 
 ## Run it
 
@@ -79,10 +97,17 @@ Requires Python 3.12+, [uv](https://docs.astral.sh/uv/) and Docker.
 uv sync
 docker compose up -d          # PostgreSQL on localhost:5433
 uv run alembic upgrade head   # create or update the tables
-uv run uvicorn webhook_service.main:app --reload
 ```
 
-Open http://127.0.0.1:8000/docs for an interactive form, or use curl:
+Then start each process in its own terminal:
+
+```bash
+uv run python dev/receiver.py                      # test receiver on :9000
+uv run uvicorn webhook_service.main:app --reload   # API on :8000
+uv run webhook-worker                              # worker
+```
+
+Submit an event, then check it. Open http://127.0.0.1:8000/docs for an interactive form.
 
 ```bash
 curl -i -X POST http://127.0.0.1:8000/deliveries \
@@ -94,16 +119,20 @@ curl http://127.0.0.1:8000/deliveries/<delivery_id>
 
 ## Experiments
 
-Milestone 2 is done when you can explain each result.
+Milestone 3 is done when you can explain each result.
 
-1. **Restart the API.** Submit an event, stop the API with Ctrl+C, start it again and `GET` the
-   delivery. It is still there. What does `202` promise that milestone 1's `200` could not?
-2. **Stop the database.** Run `docker compose stop db` and submit: `503`. Why must the API never
-   answer `202` here, and what should the producer do? Run `docker compose start db` and submit
-   again. The API recovers without a restart.
-3. **Look inside.** Run
-   `docker compose exec db psql -U webhooks -c "SELECT id, status, attempt_count FROM deliveries"`.
-   Every row stays `pending`. Who is going to send them?
+1. **Stop the API.** Run `curl -X PUT localhost:9000/mode/error`, submit two events, then stop
+   the API with Ctrl+C. The worker keeps retrying. Run `curl -X PUT localhost:9000/mode/ok`: both
+   are delivered while the API is down. Why can the two processes run independently?
+2. **Slow receiver.** Run `curl -X PUT localhost:9000/mode/slow` and submit. The worker times out
+   after 5 seconds and tries again 10 seconds later, and the receiver logs the same ID as
+   `DUPLICATE`. In milestone 1 a resend got a new ID. Why does a stable ID matter here, and why
+   must the receiver still check it?
+3. **Kill the worker mid-send.** Keep `slow` mode, submit, and while the worker waits, run
+   `kill -9 <pid>` with the PID from the worker's first log line. Run
+   `curl localhost:8000/deliveries/<delivery_id>`: it stays `processing`, even after you restart the
+   worker. Now try the same with Ctrl+C instead. Why do the two endings differ, and what would
+   recover the stuck delivery?
 
 ## Configuration
 
@@ -111,9 +140,11 @@ Set environment variables, or copy `.env.example` to `.env`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks` | Used by the API and by migrations. |
-| `RECEIVER_URL` | `http://127.0.0.1:9000/webhooks` | The only destination (from milestone 3). Producers cannot choose a URL. |
-| `DELIVERY_TIMEOUT_SECONDS` | `5` | How long one attempt waits for the receiver (from milestone 3). |
+| `DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks` | Used by the API, the worker and migrations. |
+| `RECEIVER_URL` | `http://127.0.0.1:9000/webhooks` | The only destination. Producers cannot choose a URL. |
+| `DELIVERY_TIMEOUT_SECONDS` | `5` | How long one attempt waits for the receiver. |
+| `RETRY_DELAY_SECONDS` | `10` | How long the worker waits before retrying a retryable failure. |
+| `POLL_INTERVAL_SECONDS` | `1` | How often an idle worker looks for due deliveries. |
 
 ## Development
 
@@ -140,14 +171,15 @@ uv run alembic check   # fails if models.py and the migrations disagree
 
 ```text
 src/webhook_service/
-  main.py                       app setup, 503 when storage is down, /health
+  main.py                       API app, 503 when storage is down, /health
   config.py                     settings from the environment
   db.py                         database engine and per-request session
   models.py                     deliveries table and delivery states
   schemas.py                    request, response and webhook message models
-  services/delivery_service.py  create and read deliveries; owns the commit
+  services/delivery_service.py  create, read, claim and record deliveries; owns the transactions
   api/deliveries.py             POST and GET /deliveries
-  sender.py                     sends one attempt and classifies the outcome (from milestone 3)
+  worker/main.py                the worker loop: claim, send, record
+  sender.py                     sends one attempt and classifies the outcome
 alembic/versions/               database migrations
 dev/receiver.py                 test receiver with ok / slow / error / reject modes
 tests/unit/                     tests that need no database
@@ -158,15 +190,17 @@ tests/integration/              tests against real PostgreSQL
 
 - [x] **1. HTTP path.** The endpoint sent each webhook directly. Lessons: an event held only in
   memory is lost when the receiver is down, and a timeout means "unknown", not "failed".
-- [x] **2. Store before acknowledging.** PostgreSQL, SQLAlchemy and Alembic. `POST /deliveries`
-  commits a `pending` row before answering `202`; `GET /deliveries/{id}` reads it back.
-- [ ] **3. Worker.** A separate process polls for due deliveries, sends them with `sender.py` and
-  records the results. The API can stop while the worker keeps going.
-- [ ] **4. Reliability.** Attempt history, bounded retries with backoff, `Idempotency-Key` on
-  submission, expiring claims with claim tokens, `FOR UPDATE SKIP LOCKED` for concurrent
-  workers, and concurrency tests.
+- [x] **2. Store before acknowledging.** `POST /deliveries` commits a `pending` row before
+  answering `202`. Lesson: `202` is a promise that the event is saved, so the API must answer
+  `503` rather than `202` when it cannot save it.
+- [x] **3. Worker.** A separate process claims due deliveries, sends them and records the
+  results. Lesson: accepting and delivering are separate jobs, so either side can stop without
+  losing work.
+- [ ] **4. Reliability.** Expiring claims with claim tokens (recovers stuck deliveries), attempt
+  limits with growing delays, attempt history, `Idempotency-Key` on submission, and
+  `FOR UPDATE SKIP LOCKED` so several workers can share the queue.
 - [ ] **5. Operability.** Producer authentication, signed webhooks, structured logs, metrics,
-  graceful shutdown and a runbook.
+  container deployment and a runbook.
 
 Not planned for now: destination URLs chosen by producers, multiple tenants, ordering guarantees
 and a dashboard.
