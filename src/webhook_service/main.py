@@ -1,3 +1,5 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from importlib.metadata import version
 
 from fastapi import FastAPI, Request, status
@@ -6,8 +8,24 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from webhook_service.api import deliveries
+from webhook_service.api.body_limit import BodySizeLimit
+from webhook_service.config import get_settings
 
-app = FastAPI(title="Webhook Delivery Service", version=version("webhook-delivery-service"))
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Every request reads the settings. Reading them once at startup makes an invalid value
+    # stop the API with a clear error, instead of failing each request with 500.
+    get_settings()
+    yield
+
+
+app = FastAPI(
+    title="Webhook Delivery Service",
+    version=version("webhook-delivery-service"),
+    lifespan=lifespan,
+)
+app.add_middleware(BodySizeLimit)
 app.include_router(deliveries.router)
 
 

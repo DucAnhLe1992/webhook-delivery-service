@@ -10,9 +10,11 @@ from sqlalchemy import Engine, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from webhook_service import signing
 from webhook_service.config import Settings
 from webhook_service.domain import AttemptOutcome, AttemptResult, ErrorCategory
 from webhook_service.services import delivery_service
+from webhook_service.worker import main as worker
 from webhook_service.worker.main import process_one, run
 
 EVENT = {"event_type": "booking.confirmed", "data": {"booking_id": 42}}
@@ -21,6 +23,7 @@ SETTINGS = Settings(
     max_attempts=3,
     retry_base_delay_seconds=60,
     claim_timeout_seconds=60,
+    webhook_secrets=[signing.new_secret()],
 )
 CLAIM_OPTIONS = {"claim_timeout": timedelta(seconds=60), "max_attempts": 3}
 
@@ -74,8 +77,10 @@ def test_worker_sends_a_pending_delivery_and_marks_it_delivered(client, db):
     [request] = sent
     assert str(request.url) == "http://receiver.test/webhooks"
     assert request.headers["webhook-id"] == delivery_id
+    signing.verify(SETTINGS.signing_keys, request.headers, request.content)
     message = json.loads(request.content)
     assert message["type"] == "booking.confirmed"
+    assert message["producer"] == "carrental"
     assert message["data"] == {"booking_id": 42}
     delivery = client.get(f"/deliveries/{delivery_id}").json()
     assert delivery["status"] == "delivered"
@@ -357,3 +362,12 @@ def test_an_unexpected_error_does_not_stop_the_worker(client, db, caplog):
     broken_delivery = client.get(f"/deliveries/{broken}").json()
     assert broken_delivery["status"] == "processing"
     assert broken_delivery["attempt_count"] == 1
+
+
+def test_the_worker_does_not_start_without_webhook_secrets(monkeypatch):
+    unsigned = SETTINGS.model_copy(update={"webhook_secrets": []})
+    monkeypatch.setattr(worker, "get_settings", lambda: unsigned)
+    monkeypatch.setattr(worker, "run", lambda *args: pytest.fail("the worker started"))
+
+    with pytest.raises(SystemExit, match="WEBHOOK_SECRETS is not set"):
+        worker.main()

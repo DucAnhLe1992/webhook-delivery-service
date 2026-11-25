@@ -1,8 +1,9 @@
 # How it was built
 
-The service was built in four milestones, then tightened in a fifth pass, 4.1, after an external
-review. Each milestone added a single guarantee, then ended with three experiments that broke the
-system on purpose. Each experiment's result explains why the next milestone was needed. This
+The service was built in four milestones, tightened in a pass called 4.1 after an external
+review, and then opened to several producers safely in 5.1, the first part of milestone 5. Each
+milestone added a single guarantee, then ended with three experiments that broke the system on
+purpose. Each experiment's result explains why the next milestone was needed. This
 document records the steps, the questions and the answers.
 
 For how the finished service works, see the [user manual](USER_MANUAL.md) and
@@ -15,6 +16,7 @@ For how the finished service works, see the [user manual](USER_MANUAL.md) and
 | [3. A separate worker](#milestone-3-a-separate-worker) | `milestone-3` | A worker process that claims, sends, records and retries | Stored events are sent and retried, even while the API is down | A crashed worker strands its delivery, retries never stop, and duplicates are possible |
 | [4. Reliability](#milestone-4-reliability) | `milestone-4` | Expiring claims, claim tokens, attempt history, backoff and limits, `Idempotency-Key`, `SKIP LOCKED` | At-least-once delivery through crashes, bounded retries, safe producer retries, many workers | Nothing new. An external review then found guarantees stated more strongly than the code kept them |
 | [4.1. Tighter guarantees](#milestone-41-tighter-guarantees) | `milestone-4.1` | A sender that reads only the status code, a worker loop no error can stop, honest `503` answers, a hard retry cap, a guarded test database, 14 more tests, the demo | Every guarantee worded exactly as the code keeps it, and no receiver answer can stop a worker | The remaining work is operations (milestone 5) |
+| [5.1. Trust](#milestone-51-trust) | `milestone-5.1` | Producers with hashed API keys, deliveries and idempotency keys scoped per producer, a body-size limit, signed webhooks with secret rotation, settings that never print secrets, 27 more tests | Only registered producers get in, each sees only its own deliveries, and a receiver can tell a genuine webhook from a forged, changed or replayed one | A signature covers only what it signs, so the ID, the timestamp and the producer's name must be inside it |
 
 ## Milestone 1: send it now
 
@@ -330,6 +332,128 @@ can be lost, whether at the receiver, the database or a worker, has the same sha
 "done but unconfirmed" look alike. The answer is always a stable identifier that makes the retry
 safe, and a test that puts the system exactly on that boundary.
 
+## Milestone 5.1: trust
+
+**Goal.** Know who is calling, keep producers apart, and let the receiver prove that each webhook
+came from the service, unchanged and recently. Milestone 5 was split into four parts, and this one
+came first: CarRental and Friendster, the first two producers, should not share an open endpoint.
+
+**Why.** Until now, anyone who could reach the API could submit events and read any delivery by
+its ID. Every caller shared one set of idempotency keys. A request body of any size was read into
+memory. And a receiver could not tell a webhook from the service from a request anyone could
+send. That was acceptable on one machine, not with two apps and a receiver on a network.
+
+**What was built.**
+
+- `producers` and `api_keys` tables, in migration `0004`. Every delivery now has a producer, and
+  deliveries stored earlier get one named `legacy`. Idempotency keys are unique per producer.
+- API keys: `wds_` and 32 random bytes, shown once, stored as a SHA-256 hash with the first 12
+  characters for display. A FastAPI dependency turns `Authorization: Bearer <key>` into a
+  producer, or answers `401`. A producer can have several keys, and a revoked key is refused from
+  the next request.
+- Every read and every idempotency check is scoped to the producer. Another producer's delivery
+  is `404`.
+- `webhook-admin`, a command to create producers and keys, list them, revoke keys, and make
+  webhook secrets.
+- `MAX_EVENT_BYTES`, 64 KiB by default, enforced while the body arrives: by `Content-Length`
+  before anything is read, and by counting the bytes of a body sent in chunks.
+- `signing.py`, with Standard Webhooks `v1` signatures. The sender signs every attempt with every
+  secret in `WEBHOOK_SECRETS`, and the worker does not start without one. The webhook body names
+  its producer.
+- The test receiver checks signatures, and keeps the latest copy of each webhook exactly as it
+  arrived, for replay experiments. The demo gained a fifth scene, with two producers and an
+  attacker.
+- 27 more tests, 80 in all. Sixteen hand mutations, one per safeguard, each made a test fail.
+
+**Found while building.**
+
+| Finding | What changed |
+|---|---|
+| Pydantic repeats a rejected setting in its error message, so a malformed `WEBHOOK_SECRETS`, or a `DATABASE_URL` with its password, would be printed at startup, into the logs. | Settings errors name the setting and the problem, never the value. Pydantic shortens long values in the middle, so the test looks for fragments of the secrets, not whole ones. |
+| The body limit reads the settings on every request, so an invalid setting let the API start, then answer `500` to every request, even `/health`. | The API reads its settings at startup and refuses to start. |
+| With one receiver for several producers, the receiver could not tell who sent an event, because producers choose event types freely. | The producer's name is in the signed body. A header would not be covered by the signature. |
+| With idempotency keys shared by all producers, a second producer using the same key and content would be told its event was stored, and get the other producer's delivery back. | Keys are unique per producer. |
+| The demo read friendster's delivery with carrental's key, and got `404`. | The demo reads each delivery as its owner. The scoping worked on its first real test. |
+
+**Decided against.**
+
+- **JWTs or OAuth 2 client credentials.** They suit many clients and a separate identity
+  provider. For a few server-side producers, an opaque key that can be revoked at once is simpler;
+  a JWT stays valid until it expires, unless a deny list is added.
+- **A slow hash for API keys.** See experiment 3.
+- **An administration endpoint.** It would need an administrator credential of its own.
+  `webhook-admin` relies on database access, which operators have anyway.
+- **Webhook secrets in the database.** The worker needs the secret itself to sign, so it could
+  not be stored as a hash, and every database copy would contain it.
+- **A webhook secret per producer.** The signature proves that the service sent the webhook. Which
+  producer submitted the event is the `producer` field, inside the signed body.
+- **Public-key signatures (`v1a`).** Worth it for third-party receivers, which should not hold a
+  secret that can sign. Not for one receiver run by the same team.
+- **Retrying when the receiver answers `401`.** It is a 4xx like the others: sending the same
+  webhook again cannot fix secrets that differ. The rotation procedure avoids it, and failed
+  deliveries can be replayed once the secrets are fixed.
+- **Recording when each key was last used, for now.** It would make every authenticated request
+  a write, or need batching. It is listed as a known gap, with rate limits and key expiry.
+
+**Experiments.**
+
+1. **Forge and replay a webhook.** Run `uv run python dev/demo.py` and read scene 5. Or, with the
+   test receiver and a worker running, submit an event, read its captured copy with
+   `curl localhost:9000/received`, and post it back to `localhost:9000/webhooks` with `curl`:
+   unchanged, with another `booking_id` in the body, and with a new `webhook-timestamp`. *A
+   signature proves who sent a webhook and that its body is unchanged. Why does it also cover the
+   timestamp and the `webhook-id`?*
+
+   A receiver relies on three things: what happened (the body), when the webhook was sent (the
+   timestamp), and which event it is (the ID). Whoever captures a webhook can change any part the
+   signature does not cover. If the timestamp were not signed, a webhook captured a month ago
+   could be sent with today's timestamp and pass the age check. If the ID were not signed, the
+   copy could get a new ID and pass the duplicate check. With both signed, the only replay left is
+   an exact copy within five minutes, and an exact copy carries an ID the receiver has already
+   processed. That is what scene 5 shows: the unchanged copy gets `200` but is logged as a
+   duplicate, and the changed ones get `401`. Two things a signature does not do: it does not hide
+   the content, which is HTTPS's job, and it does not prove the event is true. It proves that the
+   service sent it, and the `producer` field says which authenticated producer submitted it.
+
+2. **Two producers, one key.** Run `uv run webhook-admin create-producer friendster`, submit an
+   event with an `Idempotency-Key` that carrental already used, then ask for one of carrental's
+   deliveries with friendster's key. *Why are idempotency keys scoped to a producer, and why is
+   the answer `404` rather than `403`?*
+
+   An idempotency key is a name a producer gives its own request. Two apps that both choose
+   `order-1` are a coincidence, not a repeat. With one shared set of keys, the second app would be
+   told its event was stored while getting the other app's delivery back, so its own event would
+   silently vanish. With different content it would get `409`, and a legitimate event would be
+   refused. A producer could also find out which keys others had used. Scoping makes the producer
+   part of what identifies a request. As for `404`: a `403` says "this exists, but not for you",
+   which confirms the ID. A `404` is the same answer as for an ID that never existed, so it tells
+   the caller nothing. Delivery IDs are random UUIDs, so guessing one is hopeless anyway; the
+   uniform answer means that even a leaked ID tells another producer nothing. GitHub answers
+   `404` for private repositories for the same reason.
+
+3. **Look inside `api_keys`, then replace a key.** Run
+   `docker compose exec db psql -U webhooks -c "SELECT prefix, key_hash, revoked_at FROM api_keys"`,
+   then `uv run webhook-admin create-key carrental`, switch to the new key, and revoke the old one
+   with `uv run webhook-admin revoke-key <prefix>`. *Why can a lost key not be recovered, and why
+   is SHA-256 enough here when passwords need a slow hash such as bcrypt or Argon2?*
+
+   Only the hash is stored, and a hash cannot be reversed. Nobody can read a key back: not the
+   operator, and not an attacker with a copy of the database, which is the point, because a copy
+   of the database then grants no access. A lost key is replaced, and several keys per producer
+   make that painless. Passwords need slow hashes because people choose them, from a space small
+   enough to search: with a leaked hash, an attacker tries billions of likely passwords per second,
+   and a slow hash cuts that to thousands. A key is 32 random bytes, 2^256 possibilities. At a
+   trillion guesses per second, finding one would take about 10^57 years, so making each guess
+   100,000 times slower changes nothing. It would cost every request tens of milliseconds of CPU,
+   though, which makes the API easier to overload. And slow hashes are salted, so the API could no
+   longer find a key by looking up its hash in an index. The randomness of the key does the job a
+   slow hash does for a password.
+
+**Lesson.** Trust does not travel on its own. Each boundary needs its own proof: an API key from
+producer to service, a signature from service to receiver. And a proof covers only what it signs.
+Whatever it leaves out, an attacker can change, which is why the signature covers the ID and the
+timestamp, not only the body, and why the producer's name goes inside the body, not in a header.
+
 ## Three hops, three identifiers
 
 An event crosses three hops, and each one can repeat. Each hop has its own identifier that makes
@@ -348,21 +472,27 @@ Milestone 4.1 found one more place where an answer can be lost: the API's own co
 new identifier. The producer's retry passes through the same first hop, so its `Idempotency-Key`
 already makes the retry safe.
 
-## Milestone 5: operability (planned)
+Milestone 5.1 made the identifiers trustworthy. An `Idempotency-Key` now belongs to its producer,
+so another producer cannot collide with it. And `webhook-id` is signed, with the timestamp and the
+body, so an attacker can neither invent a new ID to get past the receiver's duplicate check nor
+reuse a captured webhook after five minutes.
 
-- Producer authentication, with idempotency keys scoped per producer.
-- Signed webhooks (`webhook-signature`, as in Standard Webhooks).
-- A time budget for every database operation: statement and lock timeouts, and a shorter wait for
-  a pooled connection than SQLAlchemy's default 30 seconds.
-- A readiness endpoint that checks the database, next to `/health`.
-- A limit on the size of submitted events.
-- Structured logs and metrics: the age of the oldest due delivery, the retry rate, and failures.
-- An endpoint to replay failed deliveries.
-- A retention job. It must keep deliveries longer than producers may retry, because deleting a
-  delivery frees its idempotency key.
-- A container image with API and worker entry points, migration steps, a shutdown grace period
-  longer than an attempt, backups, and a runbook.
-- Static type checking in CI.
+## The rest of milestone 5 (planned)
+
+Milestone 5 prepares the service to run for real. Trust came first, in 5.1. Three parts remain:
+
+- **5.2, bounded waits.** A time budget for every database operation: statement and lock
+  timeouts, and a shorter wait for a pooled connection than SQLAlchemy's default 30 seconds. A
+  readiness endpoint that checks the database, next to `/health`. A worker that checks the schema
+  at startup: since 4.1, a worker started against a database without the tables logs an error on
+  every poll instead of stopping.
+- **5.3, observability and operations.** Structured logs and metrics: the age of the oldest due
+  delivery, the retry rate, and failures. An endpoint to replay failed deliveries. A retention
+  job, which must keep deliveries longer than producers may retry, because deleting a delivery
+  frees its idempotency key.
+- **5.4, deployment.** A container image with API and worker entry points, migrations as a deploy
+  step, a shutdown grace period longer than an attempt, backups, a runbook, and static type
+  checking in CI.
 
 After that, CarRental can publish its booking events through a transactional outbox, as described
 in the [user manual](USER_MANUAL.md#recommended-integration-the-transactional-outbox).

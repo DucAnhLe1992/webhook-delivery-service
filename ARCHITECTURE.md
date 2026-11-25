@@ -15,6 +15,7 @@ the [user manual](docs/USER_MANUAL.md). To see how the design grew one guarantee
 - [Flows](#flows)
 - [Concurrency control](#concurrency-control)
 - [Retry policy](#retry-policy)
+- [Security model](#security-model)
 - [Guarantees and failure modes](#guarantees-and-failure-modes)
 - [Design decisions](#design-decisions)
 - [Testing strategy](#testing-strategy)
@@ -27,11 +28,13 @@ the [user manual](docs/USER_MANUAL.md). To see how the design grew one guarantee
 - Accept events from producer applications and deliver them to a receiver over HTTP.
 - State every guarantee explicitly and test it: what is stored, what can repeat, and what happens
   when a process dies at any moment.
+- Let only registered producers in, keep their deliveries apart, and let the receiver check that
+  every webhook is genuine.
 - Keep the moving parts few: one codebase, one PostgreSQL database, two kinds of process.
 
 **Non-goals for now**
 
-- Destinations chosen by producers (a server-side request forgery risk), multiple tenants,
+- Destinations chosen by producers (a server-side request forgery risk), a receiver per producer,
   ordering guarantees and a dashboard.
 - Message brokers such as Kafka, RabbitMQ or Redis, and Kubernetes. PostgreSQL is enough at this
   scale, and one system is easier to reason about.
@@ -40,39 +43,51 @@ the [user manual](docs/USER_MANUAL.md). To see how the design grew one guarantee
 
 ```mermaid
 flowchart LR
-    P[Producer app] -->|"POST /deliveries"| API[API process<br/>FastAPI]
+    P[Producer app] -->|"POST /deliveries<br/>with an API key"| API[API process<br/>FastAPI]
     P -->|"GET /deliveries/:id"| API
     API -->|"INSERT and COMMIT"| DB[(PostgreSQL)]
+    O[Operator] -->|"webhook-admin"| DB
     W[Worker processes<br/>one or more] -->|"claim and record"| DB
-    W -->|"POST /webhooks"| R[Receiver]
+    W -->|"signed POST /webhooks"| R[Receiver]
 ```
 
 The API and the workers never call each other. The database is their only connection: the API
 writes deliveries, and the workers claim, send and update them. That is why each side can stop,
 restart or scale on its own. Both depend on PostgreSQL, which is the one shared point of failure.
+Operators register producers and their API keys with `webhook-admin`, which also works on the
+database directly.
 
 ## Components
 
 | Component | Owns | Does not own |
 |---|---|---|
-| API: `main.py`, `api/deliveries.py` | Request validation, idempotent submission, reading deliveries, mapping errors to `409`, `422` and `503` | Sending webhooks |
-| Service layer: `services/delivery_service.py` | Every transaction: create, read, claim and record | HTTP on either side |
+| API: `main.py`, `api/deliveries.py` | Request validation, idempotent submission, reading deliveries, mapping errors to `409`, `422` and `503`, checking the settings at startup | Sending webhooks |
+| API guards: `api/dependencies.py`, `api/body_limit.py` | The producer behind the API key (`401` otherwise), and the body-size limit (`413`) | Deciding what a producer may see: the service layer filters by producer |
+| Service layer: `services/delivery_service.py` | Every delivery transaction: create, read, claim and record, each scoped to the producer where a producer is involved | HTTP on either side |
+| Producers: `services/producer_service.py` | Producers and API keys: create, hash, look up, revoke | Any delivery |
+| Admin command: `admin.py` | `webhook-admin`: producers, API keys and new webhook secrets | HTTP; it works on the database directly |
 | Worker: `worker/main.py` | The loop (claim, send, record, wait), logging, clean stop on `SIGINT`/`SIGTERM`, carrying on through database outages and unexpected errors | Deciding what an attempt means: `sender.py` classifies it, `retry.py` sets the delay, and the service layer applies the attempt limit |
-| Sender: `sender.py` | One HTTP attempt, classified by the status code alone; the response body is never read | Database state |
+| Sender: `sender.py` | One signed HTTP attempt, classified by the status code alone; the response body is never read | Database state |
+| Signing: `signing.py` | Standard Webhooks signatures: secrets, signing, and the verification receivers do | Where the secrets come from: `WEBHOOK_SECRETS` |
 | Retry policy: `retry.py` | The delay before the next attempt | Whether to retry at all, which depends on the outcome and the attempt limit |
 | Domain: `domain.py` | The shared vocabulary: delivery states, attempt outcomes, error categories and the attempt result | Any behavior; it imports nothing else from the service |
 | PostgreSQL | Durable state, the queue, uniqueness, row locks, invariants enforced by constraints | Talking to receivers |
-| Receiver (external) | Processing events and skipping duplicates by `webhook-id` | Retrying, which the service does |
+| Receiver (external) | Checking signatures, processing events, and skipping duplicates by `webhook-id` | Retrying, which the service does |
 
 ## Code structure
 
 ```mermaid
 flowchart TD
-    API[api/deliveries.py] --> SVC[services/delivery_service.py]
+    API[api/deliveries.py] --> DEP[api/dependencies.py]
+    DEP --> PRD[services/producer_service.py]
+    ADM[admin.py] --> PRD
+    API --> SVC[services/delivery_service.py]
     WRK[worker/main.py] --> SVC
     WRK --> SND[sender.py]
     WRK --> RTY[retry.py]
+    SND --> SIG[signing.py]
     SVC --> MOD[models.py]
+    PRD --> MOD
     MOD --> DB[(PostgreSQL)]
     SND --> RCV[Receiver]
     SVC --> DOM[domain.py]
@@ -84,10 +99,11 @@ flowchart TD
 use its states and outcomes, and it uses none of them. In particular, the database models do not
 depend on the HTTP sender.
 
-Four rules keep the layers honest:
+Five rules keep the layers honest:
 
-1. **The service layer owns the transactions.** HTTP handlers and the worker loop contain no SQL
-   and never commit; each service function commits its own work before it returns.
+1. **The service layer owns the transactions.** HTTP handlers, the worker loop and the admin
+   command contain no SQL and never commit; each service function commits its own work before it
+   returns.
 2. **No network call happens inside a database transaction.** The worker commits its claim before
    sending and opens a new transaction to record the result, so a slow receiver can never hold
    database locks.
@@ -97,21 +113,40 @@ Four rules keep the layers honest:
 4. **Answers from the receiver are untrusted input.** The sender reads only the status code and
    turns every kind of request failure into a classified result, and the worker loop survives
    any unexpected error. No answer can exhaust a worker's memory, hold it up or stop it.
+5. **No secret is stored or printed in a usable form.** API keys are stored as hashes and shown
+   once, webhook secrets live only in the environment, and a settings error never repeats the
+   value it rejects.
 
 ## Data model
 
 ```mermaid
 erDiagram
+    producers ||--o{ api_keys : has
+    producers ||--o{ deliveries : submits
     deliveries ||--o{ delivery_attempts : has
+    producers {
+        uuid id PK
+        varchar name UK
+        timestamptz created_at
+    }
+    api_keys {
+        uuid id PK
+        uuid producer_id FK
+        varchar key_hash UK
+        varchar prefix
+        timestamptz created_at
+        timestamptz revoked_at
+    }
     deliveries {
         uuid id PK
+        uuid producer_id FK
         varchar event_type
         jsonb payload
         varchar status
         int attempt_count
         timestamptz next_attempt_at
         uuid claim_token
-        varchar idempotency_key UK
+        varchar idempotency_key
         varchar request_fingerprint
         int last_http_status
         varchar last_error_category
@@ -131,6 +166,32 @@ erDiagram
     }
 ```
 
+`idempotency_key` is unique per producer, together with `producer_id`.
+
+### `producers`
+
+One row per application allowed to submit events.
+
+| Column | Meaning |
+|---|---|
+| `id` | Producer ID. Every delivery refers to one. |
+| `name` | For example `carrental`: lower-case letters, digits, `-` and `_`, checked by `webhook-admin`. Unique. Sent in every webhook's body as `producer`. |
+| `created_at` | When it was registered. |
+
+### `api_keys`
+
+One row per key a producer has had. A producer can have several active keys, so keys can be
+replaced without downtime.
+
+| Column | Meaning |
+|---|---|
+| `id` | Key ID. |
+| `producer_id` | The producer. Deleting a producer deletes its keys. |
+| `key_hash` | SHA-256 of the key, in hex. The key itself is never stored. Unique, and how the API finds a key. |
+| `prefix` | The key's first 12 characters, such as `wds_t408ROrX`, to tell keys apart in `webhook-admin list` and to revoke one. Not enough to use the key. |
+| `created_at` | When it was created. |
+| `revoked_at` | When it was revoked; `NULL` while it is active. Revoked keys are kept as history. |
+
 ### `deliveries`
 
 One row per accepted event. The row is both the delivery's record and its queue entry, so the two
@@ -139,13 +200,14 @@ can never disagree.
 | Column | Meaning |
 |---|---|
 | `id` | Delivery ID. Sent as `webhook-id` on every attempt. |
+| `producer_id` | The producer that submitted it. Reads and idempotency keys are scoped to it, and its name is sent in the webhook. |
 | `event_type` | For example `booking.confirmed`. |
 | `payload` | The producer's `data` object, stored as JSONB. Key order and whitespace are not kept. |
 | `status` | `pending`, `processing`, `delivered` or `failed`. |
 | `attempt_count` | Attempts claimed so far, including any cut short before the request was sent. |
 | `next_attempt_at` | While `pending`: when the delivery is due. While `processing`: when the current claim expires. Not meaningful once `delivered` or `failed`. |
 | `claim_token` | ID of the attempt that holds the claim. Set only while `processing`. |
-| `idempotency_key` | The producer's `Idempotency-Key`, if it sent one. Unique. |
+| `idempotency_key` | The producer's `Idempotency-Key`, if it sent one. Unique per producer. |
 | `request_fingerprint` | SHA-256 of the request's canonical JSON, to detect a key reused with different content. |
 | `last_http_status`, `last_error_category` | Result of the latest attempt whose worker saved it. An attempt closed as `claim_expired` by another worker does not change them. |
 | `created_at` | When the delivery was accepted. Sent as the body's `timestamp`. |
@@ -173,15 +235,20 @@ attempt closed as `claim_expired` may or may not have reached the receiver.
 
 The database enforces the invariants below, so neither a bug nor a manual edit can break them. It
 does not enforce everything: that a claim token names an attempt of the same delivery, that
-`attempt_count` matches the history, or that each status change is an allowed transition. The
-service layer keeps those, and the tests check them.
+`attempt_count` matches the history, that each status change is an allowed transition, or that a
+producer name follows the naming rule. The service layer keeps those, and the tests check them.
 
 | Name | Rule | Why |
 |---|---|---|
 | `ck_deliveries_status_valid` | `status` is one of the four states | The state machine cannot be corrupted. |
 | `ck_deliveries_claimed_while_processing` | `(status = 'processing') = (claim_token IS NOT NULL)` | Every in-flight delivery has exactly one owner, and no other row has one. |
 | `ck_deliveries_attempt_count_not_negative` | `attempt_count >= 0` | Sanity. |
-| `uq_deliveries_idempotency_key` | `idempotency_key` is unique; `NULL`s are allowed | One delivery per key. The basis of `ON CONFLICT`. |
+| `uq_deliveries_producer_id_idempotency_key` | `(producer_id, idempotency_key)` is unique; `NULL` keys are allowed | One delivery per key and producer. The basis of `ON CONFLICT`. Its index starts with `producer_id`, so it also serves lookups by producer. |
+| `fk_deliveries_producer_id_producers` | Every delivery belongs to an existing producer | A producer with deliveries cannot be deleted. |
+| `uq_producers_name` | Producer names are unique | Receivers tell producers apart by name. |
+| `uq_api_keys_key_hash` | No two keys have the same hash | The API finds a key with one index lookup. |
+| `fk_api_keys_producer_id_producers` | Every key belongs to an existing producer, and is deleted with it | No key outlives its producer. |
+| `ix_api_keys_producer_id` | Index on `api_keys.producer_id` | Lists a producer's keys. |
 | `ck_delivery_attempts_outcome_valid` | `outcome` is `NULL` or one of three values | Valid history. |
 | `ck_delivery_attempts_finished_with_outcome` | `(finished_at IS NULL) = (outcome IS NULL)` | An attempt is either running, or finished with an outcome. |
 | `uq_delivery_attempts_delivery_id` | `(delivery_id, number)` is unique | No two attempts share a number. Also indexes lookups by delivery. |
@@ -194,6 +261,7 @@ Migrations live in `alembic/versions`:
 | `0001` | `deliveries` table with status and attempt-count checks. |
 | `0002` | Last-attempt columns and an index for due `pending` rows. |
 | `0003` | `delivery_attempts`, claim tokens, idempotency columns and the claim constraint. It also moves rows left in `processing` by the old, non-expiring claims back to `pending` before adding the constraint. |
+| `0004` | `producers`, `api_keys` and `deliveries.producer_id`, with idempotency keys unique per producer. Deliveries stored before it are given a producer named `legacy`, created only if there are any, before the column becomes required. |
 
 CI runs `alembic upgrade head` and `alembic check`, so a model change without a migration fails the
 build.
@@ -240,14 +308,19 @@ sequenceDiagram
     participant P as Producer
     participant A as API
     participant D as PostgreSQL
-    P->>A: POST /deliveries with Idempotency-Key
+    P->>A: POST /deliveries with an API key and an Idempotency-Key
+    A->>A: count the body's bytes while it arrives: 413 over MAX_EVENT_BYTES
+    A->>D: SELECT the producer by the SHA-256 of the key, active keys only
+    alt no such producer
+        A-->>P: 401 Unauthorized
+    end
     A->>A: validate the body and compute the fingerprint
-    A->>D: INSERT ... ON CONFLICT (idempotency_key) DO NOTHING RETURNING
+    A->>D: INSERT ... ON CONFLICT (producer_id, idempotency_key) DO NOTHING RETURNING
     A->>D: COMMIT
-    alt a row came back, so the key is new
+    alt a row came back, so the key is new for this producer
         A-->>P: 202 with delivery_id and status pending
-    else no row came back, so the key was used before
-        A->>D: SELECT the original delivery by key
+    else no row came back, so the producer used the key before
+        A->>D: SELECT the original delivery by producer and key
         alt same fingerprint
             A-->>P: 202 with the original delivery and Idempotent-Replayed true
         else different fingerprint
@@ -277,7 +350,8 @@ sequenceDiagram
     W->>D: mark it processing and open attempt N as the claim token
     W->>D: COMMIT
     Note over W,D: no transaction is open from here until the result is saved
-    W->>R: POST /webhooks with webhook-id and webhook-timestamp
+    W->>W: sign webhook-id, webhook-timestamp and the body with each secret
+    W->>R: POST /webhooks with webhook-id, webhook-timestamp and webhook-signature
     R-->>W: status code, or a timeout or connection error. The body is never read
     W->>D: SELECT the delivery WHERE claim_token matches FOR UPDATE
     alt the claim is still held
@@ -362,11 +436,11 @@ COMMIT;
 **Idempotent submission**:
 
 ```sql
-INSERT INTO deliveries (id, event_type, payload, idempotency_key, request_fingerprint)
+INSERT INTO deliveries (id, producer_id, event_type, payload, idempotency_key, request_fingerprint)
 VALUES (...)
-ON CONFLICT (idempotency_key) DO NOTHING
+ON CONFLICT (producer_id, idempotency_key) DO NOTHING
 RETURNING *;
--- No row returned: select the existing delivery by key and compare fingerprints.
+-- No row returned: select the producer's delivery with that key and compare fingerprints.
 ```
 
 | Operation | Transaction | Locks | Why it is safe |
@@ -441,6 +515,116 @@ With the defaults (10-second base, 1-hour cap, 8 attempts), give or take 20%:
 | 7 | about 10.5 min | 640 s |
 | 8 | about 21 min | none; the delivery becomes `failed` |
 
+## Security model
+
+Trust crosses three boundaries, and each has its own proof:
+
+```mermaid
+flowchart LR
+    P[Producer] -->|"API key: who is calling"| API[API]
+    O[Operator] -->|"database access: who manages producers"| ADM[webhook-admin]
+    W[Worker] -->|"signature: who sent it, unchanged, recently"| R[Receiver]
+    R -.->|"status code only: untrusted input"| W
+```
+
+| Boundary | Threat | Defense |
+|---|---|---|
+| Producer to API | Anyone who can reach the API submits or reads events | An API key on every request to `/deliveries` |
+| Producer to API | One producer reads, or interferes with, another's deliveries | Every read and every idempotency key is scoped to the producer; another producer's delivery is `404` |
+| Producer to API | A huge body uses up the API's memory or fills the database | `MAX_EVENT_BYTES`, enforced while the body arrives |
+| Producer to API | A producer makes the service call an internal address (SSRF) | One configured destination; unknown fields are rejected |
+| Worker to receiver | Someone else posts a fake webhook to the receiver | An HMAC-SHA256 signature with a secret only the workers and the receiver have |
+| Worker to receiver | A webhook is changed on the way | The signature covers the exact body |
+| Worker to receiver | A captured webhook is sent again later | The signed timestamp and the receiver's age check; within the age limit, the signed `webhook-id` and the receiver's duplicate check |
+| Receiver to worker | An answer uses up, holds up or crashes the worker | Only the status code is read; see [Retry policy](#retry-policy) |
+| Database copies | A leaked copy gives access | Only key hashes are stored, and webhook secrets are not in the database |
+| Logs | Secrets end up in logs | Settings errors never repeat a value, and keys and secrets are never logged |
+
+### Producer authentication
+
+- A key is `wds_` followed by 32 random bytes in URL-safe base64, 47 characters in all. The prefix
+  makes a leaked key easy to recognize, for people and for secret scanners.
+- The database stores the key's SHA-256 under a unique index, and its first 12 characters for
+  display. The API hashes the key it receives and looks the hash up: one index lookup.
+- SHA-256 rather than bcrypt or Argon2. A slow hash protects passwords, which people choose and
+  attackers can guess, after a database leak. A key has 256 random bits, so no amount of guessing
+  finds one, however fast. A slow hash would only add CPU time to every request, and because it is
+  salted, it could not be looked up by index at all.
+- The lookup compares hashes, never keys. Timing it would tell an attacker about the hashes of
+  their own guesses, which says nothing about real keys.
+- A missing key gets `401` without touching the database. An unknown key and a revoked one get the
+  same `401`, with `WWW-Authenticate: Bearer`, so the answer does not reveal which keys existed.
+- Revoking a key sets `revoked_at`; the next request with it gets `401`. The row stays as history.
+  Because a producer can have several active keys, a key is replaced without downtime.
+- Producers and keys are created with `webhook-admin`, on the database. An administration endpoint
+  would need an administrator credential of its own, and would widen what the API exposes.
+
+### Producer isolation
+
+- `create_delivery` and `get_delivery` take the producer's ID, and their queries filter by it.
+- Idempotency keys are unique per producer. With one set of keys for all producers, a second
+  producer that sent the same key with the same content would be told its event was stored, and
+  get the first producer's delivery back; with different content it would get `409`. Producers
+  could collide, and could find out which keys another producer had used.
+- Another producer's delivery gets `404`, exactly like an unknown ID. A `403` would confirm that
+  the ID exists.
+- Every webhook names its producer inside the signed body. Producers choose event types freely, so
+  without it a receiver could not tell friendster's `booking.confirmed` from carrental's. A header
+  would not do: only the body, the ID and the timestamp are signed.
+
+### Webhook signatures
+
+Signing follows [Standard Webhooks](https://www.standardwebhooks.com), version `v1`:
+
+```text
+signed content     = webhook-id + "." + webhook-timestamp + "." + body
+signature          = base64(HMAC-SHA256(key, signed content))
+webhook-signature: v1,<signature> v1,<signature with the next secret> ...
+```
+
+- The key is the base64 part of a `whsec_` secret, 24 to 64 bytes; `webhook-admin
+  new-webhook-secret` makes 32.
+- The worker encodes the body once, signs those bytes, and sends them unchanged.
+- Each attempt is signed with its own timestamp, so a legitimate retry hours later still passes
+  the receiver's five-minute age check. `webhook-id` stays the same on every attempt.
+- Each signed part has a job. The body gives integrity. The timestamp stops a replay from being
+  made to look recent. The ID stops a replay from being renamed past the duplicate check. A replay
+  within the five minutes is identical to the original, so the receiver's duplicate check by
+  `webhook-id`, which at-least-once delivery needs anyway, catches it.
+- The worker signs with every secret in `WEBHOOK_SECRETS`, and receivers accept any matching
+  signature. Signing with the old and the new secret for a while lets the receiver switch at any
+  moment, so rotation needs no downtime.
+- Verification compares bytes in constant time, with `hmac.compare_digest`, so an unusual
+  character in a header cannot raise an error either.
+- The worker does not start without a secret. With optional signing, a missing setting would
+  silently send unsigned webhooks, and a receiver that accepts unsigned webhooks is protected by
+  nothing.
+- A test reproduces the specification's own test vector. Signatures made by the service were also
+  checked with the specification's Python and JavaScript libraries.
+
+### Configuration and secrets
+
+- Settings errors never repeat the rejected value (`hide_input_in_errors`). Pydantic includes the
+  input by default, which would have put webhook secrets, or the password in `DATABASE_URL`, into
+  startup logs.
+- `WEBHOOK_SECRETS` is a list of `SecretStr`, which prints as `**********`.
+- The API reads its settings at startup, so an invalid value stops it with a clear message instead
+  of failing every request with `500`.
+- `.env` is ignored by Git, and `.env.example` holds no secret.
+
+### Not covered
+
+- **Encryption in transit.** A signature proves who sent a webhook and that it is unchanged, not
+  that nobody read it. TLS belongs to the deployment: a reverse proxy in front of the API, and an
+  `https://` receiver.
+- **Rate limits.** A producer with a valid key can submit as fast as the database accepts.
+- **Key expiry and usage.** Keys are valid until revoked, and their last use is not recorded.
+- **Public-key signatures.** With one receiver run by the same team, a shared secret is enough.
+  For third-party receivers, the specification's asymmetric scheme (`v1a`) would mean no receiver
+  holds a secret that can sign.
+- **Database access.** Whoever can write to the database can create keys. Database credentials
+  are the operator's boundary.
+
 ## Guarantees and failure modes
 
 **Guarantees**
@@ -462,6 +646,11 @@ With the defaults (10-second base, 1-hour cap, 8 attempts), give or take 20%:
 6. **No ordering guarantee.** A retried event can arrive after a newer one.
 7. **Untrusted answers stay harmless.** The worker reads only the receiver's status code, and no
    answer can make it read a body, run out of memory or stop.
+8. **Authenticity.** Every webhook is signed over its ID, timestamp and body. A receiver that
+   checks the signature, the timestamp and the ID accepts genuine webhooks, and refuses forged,
+   changed and replayed ones.
+9. **Isolation.** Only requests with an active API key are served. A producer reads only its own
+   deliveries, and its idempotency keys cannot collide with another producer's.
 
 | What fails | What happens | Result |
 |---|---|---|
@@ -485,6 +674,14 @@ With the defaults (10-second base, 1-hour cap, 8 attempts), give or take 20%:
 | The same key is used with different content | `409 Conflict` | A producer bug is surfaced instead of hidden. |
 | A delivery crashes every worker that sends it | Attempts are counted when claimed | It fails after `MAX_ATTEMPTS`. |
 | `RECEIVER_URL` is changed | Deliveries waiting for a retry go to the new URL | Intended for moving the receiver. Every worker needs the same value. |
+| A request has no valid API key | `401` before anything is stored; without a key, before the database is used | Nothing changes. |
+| A producer asks for another producer's delivery | `404`, as for an unknown ID | Nothing is revealed. |
+| A body is larger than `MAX_EVENT_BYTES` | `413` while it arrives, before it is read into memory | Memory use stays bounded. |
+| The receiver refuses the signature with `401` | Like any other 4xx: `failed` at once | Fix the secrets, then replay. |
+| `WEBHOOK_SECRETS` is not set | The worker does not start | No unsigned webhook is ever sent. |
+| A setting is invalid | The API and the worker stop at startup, naming the setting but not its value | No secrets in logs, and no API that fails every request. |
+| An API key leaks | Revoke it; the next request with it gets `401` | Deliveries it submitted are kept and delivered. |
+| A webhook secret leaks | Rotate it, signing with both secrets for a while | No webhook fails during the rotation. |
 
 ## Design decisions
 
@@ -508,7 +705,20 @@ With the defaults (10-second base, 1-hour cap, 8 attempts), give or take 20%:
 | Deliveries waiting for a retry follow the current `RECEIVER_URL` | Save the URL on each delivery | Saving it would leave waiting deliveries at the old address after a planned move. With several receivers, deliveries would point to a destination by ID instead, whose URL could change. |
 | A `503` that says the outcome is unknown | "Not accepted" | A connection can fail after PostgreSQL committed, so "not accepted" would sometimes be false. The `Idempotency-Key` makes the retry safe either way. |
 | Shared types in `domain.py` | Enums in `models.py` and `sender.py` | The database models no longer depend on the HTTP sender. |
-| Standard Webhooks headers and body | A custom format | Receivers can use existing libraries, and signing (milestone 5) follows the same spec. |
+| Standard Webhooks headers and body | A custom format | Receivers can use existing libraries, and signing follows the same specification. |
+| API keys looked up by hash in the database | JWTs, or OAuth 2 client credentials | A few known producers, all server-side. Keys are simple to issue and are revoked at once; a JWT stays valid until it expires unless a deny list is added. |
+| SHA-256 for API keys | bcrypt or Argon2 | A key has 256 random bits, so guessing is hopeless even against a fast hash. A slow, salted hash would cost CPU on every request and rule out the index lookup. |
+| `404` for another producer's delivery | `403` | A `403` would confirm that the ID exists. |
+| Idempotency keys unique per producer | Unique across the service | Producers can neither collide with nor probe each other's keys. |
+| The producer's name in the signed body | A header | Only the body, `webhook-id` and `webhook-timestamp` are signed. |
+| Symmetric HMAC signatures (`v1`) | Public-key signatures (`v1a`), or a custom scheme | One receiver, run by the same team; a library exists for every common language. Public keys add a dependency and a way to distribute them. |
+| A new signature for every attempt | Sign once at submission | The receiver checks that the timestamp is recent, and a retry can come hours later. |
+| Several secrets in `WEBHOOK_SECRETS` | Exactly one | Rotation without a window in which webhooks fail. |
+| Webhook secrets in the environment | In the database | The worker needs the secret itself to sign, so it cannot be stored as a hash, and a database copy would then contain it. |
+| A worker that refuses to start without a secret | Optional signing | A missing setting must not quietly send unsigned webhooks. |
+| The body limit as ASGI middleware | A FastAPI dependency, or a reverse proxy only | FastAPI reads the whole body before any dependency runs. A proxy limit is a good extra layer, but the service should not rely on one. |
+| `webhook-admin` working on the database | An administration endpoint | No administrator credential to protect, and nothing more exposed over HTTP. |
+| A `legacy` producer for deliveries stored before 5.1 | Delete them, or allow deliveries without a producer | History is kept, and `producer_id` can be required. |
 | One configured destination | Destinations chosen by producers | Avoids server-side request forgery. Arbitrary destinations need URL validation, redirect rules and per-destination credentials. |
 | Synchronous code | `async` throughout | Simpler to reason about and test. Throughput comes from running more workers. |
 | HTTPX2 | HTTPX | The maintained continuation of HTTPX, by Pydantic, with the same API. |
@@ -516,9 +726,18 @@ With the defaults (10-second base, 1-hour cap, 8 attempts), give or take 20%:
 
 ## Testing strategy
 
-- **Unit tests** need no database: attempt classification, the webhook headers and body, retry
-  delays and the hard cap, configuration checks, and both `503` answers with an unreachable
-  database.
+- **Unit tests** need no database: attempt classification, the webhook headers, body and
+  signature, retry delays and the hard cap, configuration checks, and both `503` answers with an
+  unreachable database.
+- **Signature tests** reproduce the Standard Webhooks reference signature, and check that
+  verification refuses a changed body or ID, another secret, an old or future timestamp, a
+  refreshed timestamp, and a missing signature; that a webhook signed with two secrets verifies
+  with either; and that malformed secrets are refused without being repeated in the error.
+- **Security tests** against PostgreSQL cover requests without a key, with Basic credentials or
+  with an empty bearer token; the same answer for unknown and revoked keys; `404` across
+  producers; idempotency keys per producer; hashes at rest; replacing a key; the admin command;
+  a body at the limit, one byte over, and one sent in chunks without `Content-Length`; and a
+  worker that refuses to start without secrets.
 - **Real-HTTP tests** run the sender against a real HTTP server on a local port, because the
   behavior they check happens in the network layer that a mock transport replaces: a timeout, a
   connection dropped without an answer, and a body that is slow, huge or corrupt.
@@ -542,7 +761,14 @@ With the defaults (10-second base, 1-hour cap, 8 attempts), give or take 20%:
   `202`, the `503` handlers, the due-time filter, `SKIP LOCKED`, the claim token check,
   `FOR UPDATE` on the record step, claim expiry, `ON CONFLICT`, the fingerprint check, both
   attempt limits, the retry cap, reading only the status code, and the worker's error handling),
-  and each removal made a specific test fail.
+  and each removal made a specific test fail. Milestone 5.1 added sixteen more: the key check, the
+  revocation check, hashing, both producer filters, the signed timestamp, the age check, checking
+  only the first signature, signing other bytes than those sent, sending no signature, the
+  producer's name, the startup check, secrets in errors, the body limit, and counting a chunked
+  body.
+- **Interoperability** was checked outside the suite: the specification's Python and JavaScript
+  libraries, and the TypeScript and Python examples in the user manual, accept the service's
+  webhooks and refuse tampered ones.
 - **A demo**, `dev/demo.py`, runs the real processes and kills a real worker. It is a
   demonstration rather than a CI test, because it depends on timing.
 - **CI** (GitHub Actions) runs Ruff, the format check, `alembic upgrade head`, `alembic check`
@@ -550,25 +776,25 @@ With the defaults (10-second base, 1-hour cap, 8 attempts), give or take 20%:
 
 ## Limitations and future work
 
-Planned for milestone 5:
+Planned for the rest of milestone 5:
 
-- Producer authentication, with idempotency keys scoped per producer.
-- Signed webhooks (`webhook-signature`, as in Standard Webhooks).
-- A time budget for every database operation: statement and lock timeouts, and a shorter wait for
-  a pooled connection than SQLAlchemy's default 30 seconds.
-- A readiness endpoint that checks the database, next to `/health`.
-- A limit on the size of submitted events.
-- Structured logs and metrics: the age of the oldest due delivery, the retry rate, and failures.
-- An operator endpoint to replay failed deliveries.
-- A retention job. It must keep deliveries longer than producers may retry, because deleting a
-  delivery frees its idempotency key.
-- A container image with API and worker entry points, migration steps, a shutdown grace period
-  longer than an attempt, backups, and a runbook.
-- Static type checking in CI.
+- **5.2, bounded waits:** a time budget for every database operation (statement and lock
+  timeouts, and a shorter wait for a pooled connection than SQLAlchemy's default 30 seconds), a
+  readiness endpoint that checks the database next to `/health`, and a worker that checks the
+  schema at startup instead of logging an error on every poll.
+- **5.3, observability and operations:** structured logs; metrics such as the age of the oldest
+  due delivery, the retry rate and failures; an operator endpoint to replay failed deliveries;
+  and a retention job, which must keep deliveries longer than producers may retry, because
+  deleting a delivery frees its idempotency key.
+- **5.4, deployment:** a container image with API and worker entry points, migrations as a
+  deploy step, a shutdown grace period longer than an attempt, backups, a runbook, and static
+  type checking in CI.
 
 Known gaps:
 
 - Idempotency keys never expire, and old rows are never cleaned up.
+- No rate limit per producer, no expiry for API keys, and no record of a key's last use.
+- One receiver, with one set of webhook secrets for every producer.
 - There is no deadline for a whole attempt. `DELIVERY_TIMEOUT_SECONDS` limits each network step,
   so a receiver that sends its status line a few bytes at a time can outlast the claim. The cost
   is a duplicate, never a corrupted state. A true deadline needs `async` cancellation or a custom

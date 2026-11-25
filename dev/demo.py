@@ -3,13 +3,16 @@
     uv run python dev/demo.py
 
 PostgreSQL must be running (docker compose up -d --wait). The demo uses its own database,
-webhooks_demo, and starts the test receiver, the API and a worker on free ports. Short
-timeouts keep it to about half a minute. It plays four scenes:
+webhooks_demo, with two producers, carrental and friendster. It starts the test receiver,
+the API and a worker on free ports, with a webhook secret made for the run. Short timeouts
+keep it to about half a minute. It plays five scenes:
 
 1. A request repeated with the same Idempotency-Key is stored once.
 2. While the receiver is down, the worker retries with growing waits.
 3. An answer that arrives too late makes the worker send the event again.
 4. A worker killed in the middle of a delivery is replaced, and the delivery is sent again.
+5. Only known producers may submit, each sees only its own deliveries, and the receiver
+   refuses webhooks that were changed, forged or replayed.
 """
 
 import os
@@ -31,8 +34,11 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import URL, create_engine, make_url, text
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
+from webhook_service import signing
 from webhook_service.config import get_settings
+from webhook_service.services import producer_service
 
 ROOT = Path(__file__).resolve().parents[1]
 DATABASE = "webhooks_demo"
@@ -110,8 +116,11 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
-def prepare_database() -> URL:
-    """Create and migrate the demo database if needed, and empty it."""
+def prepare_database() -> tuple[URL, dict[str, str]]:
+    """Create and migrate the demo database if needed, empty it, and add two producers.
+
+    Returns the database URL and each producer's API key.
+    """
     url = make_url(str(get_settings().database_url)).set(database=DATABASE)
     server = create_engine(url.set(database="postgres"), isolation_level="AUTOCOMMIT")
     try:
@@ -129,20 +138,27 @@ def prepare_database() -> URL:
     command.upgrade(config, "head")
     engine = create_engine(url)
     with engine.begin() as connection:
-        connection.execute(text("TRUNCATE deliveries, delivery_attempts"))
+        connection.execute(text("TRUNCATE deliveries, delivery_attempts, api_keys, producers"))
+    keys = {}
+    with Session(engine) as session:
+        for name in ("carrental", "friendster"):
+            _, keys[name] = producer_service.create_producer(session, name)
     engine.dispose()
-    return url
+    return url, keys
 
 
 class Demo:
-    def __init__(self, database_url: URL, log_dir: Path) -> None:
+    def __init__(self, database_url: URL, api_keys: dict[str, str], log_dir: Path) -> None:
         receiver_port, api_port = free_port(), free_port()
+        # The worker signs with this secret, and the receiver checks signatures with it.
+        self.secret = signing.new_secret()
         env = {
             **os.environ,
             **SETTINGS,
             "PYTHONUNBUFFERED": "1",
             "DATABASE_URL": database_url.render_as_string(hide_password=False),
             "RECEIVER_URL": f"http://127.0.0.1:{receiver_port}/webhooks",
+            "WEBHOOK_SECRETS": self.secret,
         }
         python = sys.executable
         self.receiver = Process(
@@ -162,12 +178,22 @@ class Demo:
         self.worker = Process("worker", worker, env, log_dir)
         self.worker_2 = Process("worker-2", worker, env, log_dir)
         self.processes = [self.receiver, self.api, self.worker, self.worker_2]
-        self.api_client = httpx2.Client(base_url=f"http://127.0.0.1:{api_port}", timeout=5)
+        api_url = f"http://127.0.0.1:{api_port}"
+        # Scenes 1 to 4 submit as carrental.
+        self.api_client = self.producer_client(api_url, api_keys["carrental"])
+        self.friendster_client = self.producer_client(api_url, api_keys["friendster"])
+        self.anonymous_client = httpx2.Client(base_url=api_url, timeout=5)
         self.receiver_client = httpx2.Client(
             base_url=f"http://127.0.0.1:{receiver_port}", timeout=5
         )
 
     # Helpers
+
+    @staticmethod
+    def producer_client(api_url: str, api_key: str) -> httpx2.Client:
+        return httpx2.Client(
+            base_url=api_url, headers={"Authorization": f"Bearer {api_key}"}, timeout=5
+        )
 
     def show_logs(self) -> None:
         lines = [line for process in self.processes for line in process.new_lines()]
@@ -200,13 +226,16 @@ class Demo:
             headers={"Idempotency-Key": key},
         )
 
-    def delivery(self, delivery_id: str) -> dict[str, Any]:
-        return self.api_client.get(f"/deliveries/{delivery_id}").json()
+    def delivery(self, delivery_id: str, client: httpx2.Client | None = None) -> dict[str, Any]:
+        """Read a delivery as its producer, carrental unless another client is given."""
+        return (client or self.api_client).get(f"/deliveries/{delivery_id}").json()
 
-    def wait_until_delivered(self, delivery_id: str, timeout: float = 30) -> None:
+    def wait_until_delivered(
+        self, delivery_id: str, client: httpx2.Client | None = None, timeout: float = 30
+    ) -> None:
         self.wait_until(
             "the delivery is delivered",
-            lambda: self.delivery(delivery_id)["status"] == "delivered",
+            lambda: self.delivery(delivery_id, client)["status"] == "delivered",
             timeout,
         )
         # The worker logs the result just after saving it.
@@ -236,6 +265,7 @@ class Demo:
     def start(self) -> None:
         print("Starting the receiver, the API and a worker with these settings:")
         print("  " + ", ".join(f"{name}={value}" for name, value in SETTINGS.items()))
+        print("  WEBHOOK_SECRETS=<a secret made for this run, which the receiver has too>")
         self.receiver.start()
         self.api.start()
         self.worker.start()
@@ -338,22 +368,107 @@ class Demo:
             "had to send it again. Sending once and never again could lose the event."
         )
 
+    def scene_5(self) -> None:
+        print("\nScene 5: who may submit, who may read, and who sent a webhook")
+        say(
+            "The API knows two producers, carrental and friendster. Each has its own API key "
+            "and its own idempotency keys. The worker signs every webhook with the secret it "
+            "shares with the receiver."
+        )
+        event = {"event_type": "booking.confirmed", "data": {"booking_id": 5}}
+        key = {"Idempotency-Key": "event-5"}
+        anonymous = self.anonymous_client.post("/deliveries", json=event)
+        self.note(f"{'POST without an API key':<44}-> {anonymous.status_code}")
+        own = self.api_client.post("/deliveries", json=event, headers=key)
+        own_id = own.json()["delivery_id"]
+        self.note(
+            f"{'carrental:  POST, Idempotency-Key event-5':<44}-> {own.status_code}, "
+            f"{short(own_id)}"
+        )
+        other = self.friendster_client.post(
+            "/deliveries", json={"event_type": "post.liked", "data": {"post_id": 5}}, headers=key
+        )
+        other_id = other.json()["delivery_id"]
+        self.note(
+            f"{'friendster: POST, Idempotency-Key event-5':<44}-> {other.status_code}, "
+            f"{short(other_id)}, not a replay"
+        )
+        peek = self.friendster_client.get(f"/deliveries/{own_id}")
+        label = f"friendster: GET carrental's {short(own_id)}"
+        self.note(f"{label:<44}-> {peek.status_code}, as for an ID that does not exist")
+        huge = {"event_type": "booking.confirmed", "data": {"notes": "x" * 100_000}}
+        too_large = self.api_client.post("/deliveries", json=huge)
+        self.note(f"{'carrental:  POST a 100 KB event':<44}-> {too_large.status_code}")
+        self.wait_until_delivered(own_id)
+        self.wait_until_delivered(other_id, self.friendster_client)
+        say(
+            "Both webhooks passed the receiver's signature check, and each says which "
+            "producer it came from. Now an attacker who captured carrental's webhook on its "
+            "way to the receiver tries to use it."
+        )
+        captured = self.receiver_client.get("/received").json()[own_id]["request"]
+        headers, body = captured["headers"], captured["body"].encode()
+        attacks = [
+            ("sends it again, unchanged", headers, body),
+            (
+                "changes booking_id in the body",
+                headers,
+                body.replace(b'"booking_id":5', b'"booking_id":6'),
+            ),
+            (
+                "gives it a new timestamp",
+                headers | {"webhook-timestamp": str(int(time.time()) + 1)},
+                body,
+            ),
+            (
+                "signs it with a guessed secret",
+                self.signed_with_a_guessed_secret(headers, body),
+                body,
+            ),
+        ]
+        for description, attack_headers, attack_body in attacks:
+            response = self.receiver_client.post(
+                "/webhooks",
+                content=attack_body,
+                headers=attack_headers | {"content-type": "application/json"},
+            )
+            time.sleep(0.2)
+            self.note(f"{'Attacker ' + description:<44}-> {response.status_code}")
+        say(
+            "The copy sent unchanged passed the signature check, but it has the same webhook-id "
+            "as the original, so the receiver's duplicate check catches it. Five minutes after "
+            "it was signed, the receiver refuses it outright, and a new timestamp would break "
+            "its signature."
+        )
+
+    def signed_with_a_guessed_secret(self, headers: dict[str, str], body: bytes) -> dict[str, str]:
+        guess = signing.decode_secret(signing.new_secret())
+        webhook_id, timestamp = headers["webhook-id"], int(headers["webhook-timestamp"])
+        return headers | {
+            "webhook-signature": signing.signature_header([guess], webhook_id, timestamp, body)
+        }
+
     def stop(self) -> None:
         print("\nStopping the processes.")
         for process in reversed(self.processes):
             process.stop()
         self.show_logs()
-        self.api_client.close()
-        self.receiver_client.close()
+        for client in (
+            self.api_client,
+            self.friendster_client,
+            self.anonymous_client,
+            self.receiver_client,
+        ):
+            client.close()
 
 
 def main() -> None:
     log_dir = Path(tempfile.mkdtemp(prefix="webhook-demo-"))
     try:
-        database_url = prepare_database()
+        database_url, api_keys = prepare_database()
     except OperationalError:
         sys.exit("PostgreSQL is not reachable. Start it with: docker compose up -d --wait")
-    demo = Demo(database_url, log_dir)
+    demo = Demo(database_url, api_keys, log_dir)
     started = time.monotonic()
     failed = True
     try:
@@ -362,6 +477,7 @@ def main() -> None:
         demo.scene_2()
         demo.scene_3()
         demo.scene_4()
+        demo.scene_5()
         failed = False
     except DemoError as error:
         print(f"\n{error} The process logs are in {log_dir}.")

@@ -27,18 +27,19 @@ def request_fingerprint(event_type: str, data: dict[str, Any]) -> str:
 def create_delivery(
     session: Session,
     *,
+    producer_id: uuid.UUID,
     event_type: str,
     data: dict[str, Any],
     idempotency_key: str | None = None,
 ) -> tuple[Delivery, bool]:
     """Store a new delivery and return it with created=True.
 
-    If the idempotency key was used before, return the original delivery with
+    If the producer used the idempotency key before, return the original delivery with
     created=False instead, or raise IdempotencyKeyReused if the content differs.
     Either way the result is committed before the API answers: "accepted" means "stored".
     """
     if idempotency_key is None:
-        delivery = Delivery(event_type=event_type, payload=data)
+        delivery = Delivery(producer_id=producer_id, event_type=event_type, payload=data)
         session.add(delivery)
         session.commit()
         return delivery, True
@@ -49,12 +50,13 @@ def create_delivery(
     inserted = session.scalars(
         insert(Delivery)
         .values(
+            producer_id=producer_id,
             event_type=event_type,
             payload=data,
             idempotency_key=idempotency_key,
             request_fingerprint=fingerprint,
         )
-        .on_conflict_do_nothing(index_elements=[Delivery.idempotency_key])
+        .on_conflict_do_nothing(index_elements=[Delivery.producer_id, Delivery.idempotency_key])
         .returning(Delivery)
     ).one_or_none()
     session.commit()
@@ -62,15 +64,24 @@ def create_delivery(
         return inserted, True
 
     original = session.scalars(
-        select(Delivery).where(Delivery.idempotency_key == idempotency_key)
+        select(Delivery).where(
+            Delivery.producer_id == producer_id, Delivery.idempotency_key == idempotency_key
+        )
     ).one()
     if original.request_fingerprint != fingerprint:
         raise IdempotencyKeyReused(idempotency_key)
     return original, False
 
 
-def get_delivery(session: Session, delivery_id: uuid.UUID) -> Delivery | None:
-    return session.get(Delivery, delivery_id, options=[selectinload(Delivery.attempts)])
+def get_delivery(
+    session: Session, delivery_id: uuid.UUID, *, producer_id: uuid.UUID
+) -> Delivery | None:
+    """The producer's delivery with this ID, or None, also if another producer owns it."""
+    return session.scalars(
+        select(Delivery)
+        .where(Delivery.id == delivery_id, Delivery.producer_id == producer_id)
+        .options(selectinload(Delivery.attempts))
+    ).one_or_none()
 
 
 def claim_next_due(

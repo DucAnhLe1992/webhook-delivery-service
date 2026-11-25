@@ -22,7 +22,8 @@ def storage_down() -> Iterator[TestClient]:
             yield session
 
     app.dependency_overrides[get_session] = unreachable_session
-    yield TestClient(app)
+    # With a key, so that checking it is what needs the database.
+    yield TestClient(app, headers={"Authorization": "Bearer wds_any"})
     app.dependency_overrides.clear()
 
 

@@ -1,18 +1,33 @@
 from functools import lru_cache
-from typing import Self
+from typing import Annotated, Self
 
-from pydantic import HttpUrl, PositiveFloat, PositiveInt, PostgresDsn, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import (
+    HttpUrl,
+    PositiveFloat,
+    PositiveInt,
+    PostgresDsn,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from webhook_service.signing import decode_secret
 
 
 class Settings(BaseSettings):
     """Read from environment variables (or a local .env file), e.g. RECEIVER_URL."""
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # An invalid value is not repeated in the error message, because some values are secrets
+    # (WEBHOOK_SECRETS, the password in DATABASE_URL) and error messages end up in logs.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     database_url: PostgresDsn = PostgresDsn(
         "postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks"
     )
+
+    # API: the largest request body it reads, in bytes, which limits the size of an event.
+    max_event_bytes: PositiveInt = 65536
 
     # The only destination. Producers never choose where a webhook goes, which keeps
     # the service from being used to make requests to arbitrary addresses (SSRF). Deliveries
@@ -21,6 +36,10 @@ class Settings(BaseSettings):
     receiver_url: HttpUrl = HttpUrl("http://127.0.0.1:9000/webhooks")
     # How long each network step of an attempt may take; see claim_outlasts_an_attempt.
     delivery_timeout_seconds: PositiveFloat = 5.0
+    # Worker: the secrets it signs webhooks with, separated by spaces. Each is whsec_ followed
+    # by 24 to 64 random bytes in base64 (`webhook-admin new-webhook-secret` makes one). Every
+    # secret signs every webhook, so a receiver can move to a new secret without missing any.
+    webhook_secrets: Annotated[list[SecretStr], NoDecode] = []
 
     # Worker: a delivery gets at most max_attempts attempts. After a retryable failure it
     # waits retry_base_delay_seconds, doubling each time up to retry_max_delay_seconds.
@@ -31,6 +50,25 @@ class Settings(BaseSettings):
     # dead and another worker sends the delivery again.
     claim_timeout_seconds: PositiveFloat = 60.0
     poll_interval_seconds: PositiveFloat = 1.0
+
+    @field_validator("webhook_secrets", mode="before")
+    @classmethod
+    def split_on_spaces(cls, value: object) -> object:
+        return value.split() if isinstance(value, str) else value
+
+    @field_validator("webhook_secrets")
+    @classmethod
+    def secrets_are_valid(cls, secrets: list[SecretStr]) -> list[SecretStr]:
+        for number, secret in enumerate(secrets, start=1):
+            try:
+                decode_secret(secret.get_secret_value())
+            except ValueError as error:
+                raise ValueError(f"secret {number} in WEBHOOK_SECRETS: {error}") from None
+        return secrets
+
+    @property
+    def signing_keys(self) -> list[bytes]:
+        return [decode_secret(secret.get_secret_value()) for secret in self.webhook_secrets]
 
     @model_validator(mode="after")
     def claim_outlasts_an_attempt(self) -> Self:

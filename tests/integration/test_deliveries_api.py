@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from webhook_service.config import get_settings
 from webhook_service.db import get_session
 from webhook_service.main import app
 from webhook_service.services import delivery_service
@@ -96,8 +97,9 @@ def submit_while_another_request_stores_the_key(
         other_request.execute(
             text(
                 "INSERT INTO deliveries"
-                " (id, event_type, payload, idempotency_key, request_fingerprint)"
-                " VALUES (:id, :event_type, CAST(:payload AS jsonb), :key, :fingerprint)"
+                " (id, producer_id, event_type, payload, idempotency_key, request_fingerprint)"
+                " SELECT :id, id, :event_type, CAST(:payload AS jsonb), :key, :fingerprint"
+                " FROM producers WHERE name = 'carrental'"
             ),
             {
                 "id": other_id,
@@ -188,9 +190,9 @@ def test_a_submission_whose_commit_was_not_confirmed_can_be_retried_with_its_key
         ]
 
 
-def test_a_full_connection_pool_returns_503(engine):
+def test_a_full_connection_pool_returns_503(db, api_key):
     # One pooled connection, which is in use, and a short wait for it to come back.
-    busy = create_engine(engine.url, pool_size=1, max_overflow=0, pool_timeout=0.1)
+    busy = create_engine(db.url, pool_size=1, max_overflow=0, pool_timeout=0.1)
 
     def busy_session():
         with Session(busy) as session:
@@ -199,10 +201,47 @@ def test_a_full_connection_pool_returns_503(engine):
     app.dependency_overrides[get_session] = busy_session
     try:
         with busy.connect():
-            response = TestClient(app).post("/deliveries", json=EVENT, headers=KEY)
+            response = TestClient(app).post(
+                "/deliveries", json=EVENT, headers=KEY | {"Authorization": f"Bearer {api_key}"}
+            )
     finally:
         app.dependency_overrides.clear()
         busy.dispose()
 
     assert response.status_code == 503
     assert response.headers["retry-after"] == "5"
+
+
+def event_of_size(size: int) -> bytes:
+    """A valid event whose JSON is exactly `size` bytes long."""
+    padding = size - len(json.dumps({**EVENT, "data": {"padding": ""}}))
+    return json.dumps({**EVENT, "data": {"padding": "x" * padding}}).encode()
+
+
+def test_an_event_up_to_the_size_limit_is_accepted_and_a_larger_one_is_not(client, db):
+    limit = get_settings().max_event_bytes
+    json_body = {"content-type": "application/json"}
+
+    at_limit = client.post("/deliveries", content=event_of_size(limit), headers=json_body)
+    over_limit = client.post("/deliveries", content=event_of_size(limit + 1), headers=json_body)
+
+    assert at_limit.status_code == 202
+    assert over_limit.status_code == 413
+    with db.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM deliveries")) == 1
+
+
+def test_an_event_sent_in_chunks_is_held_to_the_size_limit(client, db):
+    body = event_of_size(get_settings().max_event_bytes + 1)
+
+    def chunks():
+        for start in range(0, len(body), 4096):
+            yield body[start : start + 4096]
+
+    response = client.post(
+        "/deliveries", content=chunks(), headers={"content-type": "application/json"}
+    )
+
+    # Without Content-Length, the size is only known by counting the body as it arrives.
+    assert "content-length" not in response.request.headers
+    assert response.status_code == 413

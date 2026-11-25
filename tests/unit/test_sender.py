@@ -7,15 +7,19 @@ import time
 import httpx2
 import pytest
 
+from webhook_service import signing
 from webhook_service.domain import AttemptOutcome, ErrorCategory
 from webhook_service.sender import classify_status, send_webhook
 
 MB = 1024 * 1024
+KEY = signing.decode_secret(signing.new_secret())
 
 
 def send_to(receiver):
     with httpx2.Client(transport=httpx2.MockTransport(receiver)) as client:
-        return send_webhook(client, "http://receiver.test/webhooks", "wh_123", {"type": "a.b"})
+        return send_webhook(
+            client, "http://receiver.test/webhooks", "wh_123", {"type": "a.b"}, signing_keys=[KEY]
+        )
 
 
 @pytest.mark.parametrize(
@@ -56,7 +60,7 @@ def test_network_failures_are_retryable(error, category):
     assert result.http_status is None
 
 
-def test_sends_json_body_with_standard_webhooks_headers():
+def test_sends_a_signed_json_body_with_standard_webhooks_headers():
     sent = []
 
     def receiver(request):
@@ -72,6 +76,8 @@ def test_sends_json_body_with_standard_webhooks_headers():
     assert request.headers["webhook-timestamp"].isdigit()
     assert request.headers["content-type"] == "application/json"
     assert json.loads(request.content) == {"type": "a.b"}
+    # The signature covers the bytes that were actually sent.
+    signing.verify([KEY], request.headers, request.content)
 
 
 # The tests below use a real HTTP server on a local socket, because the behaviour they check
@@ -150,7 +156,7 @@ def real_receiver():
 def send_over_http(server, path, *, timeout=0.5):
     url = f"http://127.0.0.1:{server.server_address[1]}{path}"
     with httpx2.Client(timeout=timeout) as client:
-        return send_webhook(client, url, "wh_123", {"type": "a.b"})
+        return send_webhook(client, url, "wh_123", {"type": "a.b"}, signing_keys=[KEY])
 
 
 def test_a_slowly_sent_body_does_not_hold_up_the_attempt(real_receiver):

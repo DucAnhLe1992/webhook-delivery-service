@@ -1,17 +1,18 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Header, HTTPException, Response, status
 
-from webhook_service.db import get_session
+from webhook_service.api.dependencies import ProducerDep, SessionDep
 from webhook_service.domain import DeliveryStatus
 from webhook_service.schemas import DeliveryAccepted, DeliveryDetail, DeliveryRequest
 from webhook_service.services import delivery_service
 
-router = APIRouter(prefix="/deliveries", tags=["deliveries"])
-
-SessionDep = Annotated[Session, Depends(get_session)]
+router = APIRouter(
+    prefix="/deliveries",
+    tags=["deliveries"],
+    responses={status.HTTP_401_UNAUTHORIZED: {"description": "Missing or invalid API key"}},
+)
 
 
 # These are plain `def` functions, not `async def`: FastAPI runs them in a thread pool,
@@ -23,6 +24,9 @@ SessionDep = Annotated[Session, Depends(get_session)]
         status.HTTP_409_CONFLICT: {
             "description": "The Idempotency-Key was already used for a different request"
         },
+        status.HTTP_413_CONTENT_TOO_LARGE: {
+            "description": "The request body is larger than MAX_EVENT_BYTES"
+        },
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "description": "Storage is unavailable, so it is not known whether the delivery "
             "was stored. Retry with the same Idempotency-Key."
@@ -32,17 +36,23 @@ SessionDep = Annotated[Session, Depends(get_session)]
 def submit_delivery(
     body: DeliveryRequest,
     response: Response,
+    producer: ProducerDep,
     session: SessionDep,
     idempotency_key: Annotated[str | None, Header(min_length=1, max_length=255)] = None,
 ) -> DeliveryAccepted:
     """Store an event for delivery. 202 means it is saved in the database, not yet sent.
 
     With an Idempotency-Key header, repeating the request returns the original delivery
-    (marked with Idempotent-Replayed: true) instead of storing it twice.
+    (marked with Idempotent-Replayed: true) instead of storing it twice. Each producer has
+    its own idempotency keys.
     """
     try:
         delivery, created = delivery_service.create_delivery(
-            session, event_type=body.event_type, data=body.data, idempotency_key=idempotency_key
+            session,
+            producer_id=producer.id,
+            event_type=body.event_type,
+            data=body.data,
+            idempotency_key=idempotency_key,
         )
     except delivery_service.IdempotencyKeyReused:
         raise HTTPException(
@@ -58,12 +68,15 @@ def submit_delivery(
 @router.get(
     "/{delivery_id}",
     responses={
-        status.HTTP_404_NOT_FOUND: {"description": "No delivery with this ID"},
+        status.HTTP_404_NOT_FOUND: {"description": "This producer has no delivery with this ID"},
         status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Storage is unavailable"},
     },
 )
-def read_delivery(delivery_id: uuid.UUID, session: SessionDep) -> DeliveryDetail:
-    delivery = delivery_service.get_delivery(session, delivery_id)
+def read_delivery(
+    delivery_id: uuid.UUID, producer: ProducerDep, session: SessionDep
+) -> DeliveryDetail:
+    delivery = delivery_service.get_delivery(session, delivery_id, producer_id=producer.id)
     if delivery is None:
+        # Also when the delivery belongs to another producer: 403 would confirm that it exists.
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Delivery not found")
     return DeliveryDetail.from_model(delivery)

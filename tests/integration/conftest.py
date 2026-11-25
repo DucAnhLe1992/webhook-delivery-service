@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from webhook_service.config import get_settings
 from webhook_service.db import get_session
 from webhook_service.main import app
+from webhook_service.services import producer_service
 
 ROOT = Path(__file__).resolve().parents[2]
 TEST_DATABASE_URL = make_url(
@@ -79,21 +80,45 @@ def engine() -> Iterator[Engine]:
 def db(engine: Engine) -> Engine:
     """The test database, emptied before each test."""
     with engine.begin() as connection:
-        connection.execute(text("TRUNCATE deliveries, delivery_attempts"))
+        connection.execute(text("TRUNCATE deliveries, delivery_attempts, api_keys, producers"))
     return engine
 
 
+def authenticated_as(api_key: str) -> TestClient:
+    return TestClient(app, headers={"Authorization": f"Bearer {api_key}"})
+
+
 @pytest.fixture
-def client(db: Engine) -> Iterator[TestClient]:
-    """An API client that uses the emptied test database."""
+def api_key(db: Engine) -> str:
+    """The API key of the producer carrental."""
+    with Session(db) as session:
+        _, key = producer_service.create_producer(session, "carrental")
+    return key
+
+
+@pytest.fixture
+def client(db: Engine, api_key: str) -> Iterator[TestClient]:
+    """An API client for the producer carrental, using the emptied test database."""
 
     def test_session() -> Iterator[Session]:
         with Session(db, expire_on_commit=False) as session:
             yield session
 
     app.dependency_overrides[get_session] = test_session
-    yield TestClient(app)
+    yield authenticated_as(api_key)
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client_for(client: TestClient, db: Engine) -> Callable[[str], TestClient]:
+    """Return a function that creates a producer and an API client for it."""
+
+    def create(name: str) -> TestClient:
+        with Session(db) as session:
+            _, key = producer_service.create_producer(session, name)
+        return authenticated_as(key)
+
+    return create
 
 
 @pytest.fixture

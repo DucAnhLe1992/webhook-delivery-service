@@ -1,6 +1,6 @@
 [project]
 name = "webhook-delivery-service"
-version = "0.4.1"
+version = "0.5.1"
 description = "Accepts events from producer apps and delivers them as webhooks to a configured receiver."
 readme = "README.md"
 authors = [
@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 webhook-worker = "webhook_service.worker.main:main"
+webhook-admin = "webhook_service.admin:main"
 
 [build-system]
 requires = ["uv_build>=0.9.14,<0.10.0"]

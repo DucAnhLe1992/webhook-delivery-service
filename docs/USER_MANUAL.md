@@ -12,6 +12,7 @@ Who should read what:
 | Building a producer, an app that sends events | [Submitting events](#3-submitting-events), [Tracking deliveries](#4-tracking-deliveries) |
 | Building a receiver, an app that gets webhooks | [Receiving webhooks](#5-receiving-webhooks) |
 | Curious how it all fits together | [How a delivery flows](#6-how-a-delivery-flows) |
+| Managing producers, API keys and secrets | [Producers and API keys](#producers-and-api-keys), [Rotating the webhook secret](#rotating-the-webhook-secret) |
 | Keeping it healthy | [Operating the service](#8-operating-the-service) |
 
 ## Contents
@@ -35,8 +36,10 @@ webhook), keeps trying when the receiver is down, and records every attempt.
 
 | Term | Meaning |
 |---|---|
-| **Producer** | An application that submits events, for example CarRental. |
+| **Producer** | An application that submits events, for example CarRental. An operator registers it with `webhook-admin`. It sees only its own deliveries. |
+| **API key** | A producer's credential, sent with every request as `Authorization: Bearer <key>`. A producer can have several. The service stores only a hash of each. |
 | **Receiver** | The HTTP endpoint that gets the webhooks. There is one, set by `RECEIVER_URL`. |
+| **Webhook secret** | A secret the workers and the receiver share. Workers sign every webhook with it, and the receiver checks the signature. |
 | **Delivery** | One accepted event and its delivery state. Its ID is sent to the receiver as `webhook-id`. |
 | **Attempt** | One try at sending a delivery. It is recorded when a worker claims the delivery, so an attempt cut short by a crash may never have reached the receiver. A delivery can have several. |
 | **API** | The process that accepts and reports deliveries (`uvicorn webhook_service.main:app`). |
@@ -54,6 +57,7 @@ A delivery is always in one of four states:
 
 What the service promises, in plain words:
 
+- **Only registered producers can submit or read deliveries, and each sees only its own.**
 - **When the API answers `202`, the event is saved.** It survives restarts of the API, the workers
   and the database server.
 - **When the API answers `503`, or no answer arrives, the event may or may not be saved.** The
@@ -64,6 +68,8 @@ What the service promises, in plain words:
 - **An event may arrive more than once.** When the service cannot tell whether the receiver got it
   (a timeout, or a worker crash), it sends it again with the same `webhook-id`. Receivers must skip
   IDs they have already processed.
+- **Every webhook is signed.** A receiver that checks the signature can refuse webhooks that were
+  forged, changed on the way, or replayed later.
 - **Sending the same request twice is safe** if the producer includes an `Idempotency-Key` header.
 - **Events can arrive out of order.**
 
@@ -80,10 +86,21 @@ What the service promises, in plain words:
 uv sync                       # install dependencies into .venv
 docker compose up -d --wait   # start PostgreSQL 18 on localhost:5433 and wait until it is ready
 uv run alembic upgrade head   # create the tables
+
+# A secret to sign webhooks with. The worker signs with it, and the test receiver checks with it.
+echo "WEBHOOK_SECRETS=$(uv run webhook-admin new-webhook-secret)" >> .env
+
+# A producer. Its API key is printed only once, so keep it.
+API_KEY=$(uv run webhook-admin create-producer carrental)
 ```
 
 PostgreSQL listens only on `127.0.0.1`, with user, password and database all set to `webhooks`.
 Its data lives in the `pgdata` volume declared in `compose.yaml`.
+
+Every process started in this folder reads `.env`, and Git ignores it. `create-producer` prints
+only the key on standard output, so `$(...)` captures it. If you lose it, create another with
+`uv run webhook-admin create-key carrental`. [Producers and API keys](#producers-and-api-keys)
+covers the rest.
 
 ### Starting the processes
 
@@ -105,7 +122,7 @@ The worker shows one line per attempt, starting with the delivery ID and the att
 the receiver answered `500` to the first attempt and `200` to the retry 11 seconds later:
 
 ```text
-01:28:38 [worker] started (pid 186013), sending to http://127.0.0.1:9000/webhooks
+01:28:38 [worker] started (pid 186013), sending to http://127.0.0.1:9000/webhooks, signing with 1 secret(s)
 01:28:50 [worker] 73731487-6839-4966-b9b2-9b2a1a83054c attempt 1: failed (HTTP 500), retrying in 10s
 01:29:01 [worker] 73731487-6839-4966-b9b2-9b2a1a83054c attempt 2: delivered (HTTP 200, 2 ms)
 ```
@@ -122,12 +139,14 @@ Times are in the machine's local time. Other worker messages:
 | `database unavailable, trying again in 1.0s` | PostgreSQL is down; the worker keeps polling. |
 | `unexpected error, trying again in 1.0s`, with a traceback | A bug. The worker carries on with other deliveries; the one it held is sent again when its claim expires. |
 | `stopping after the current delivery`, then `stopped` | A clean stop after Ctrl+C or `SIGTERM`. |
+| `WEBHOOK_SECRETS is not set, and the worker does not send unsigned webhooks…`, and the worker exits | No webhook secret is configured. See [First-time setup](#first-time-setup). |
 
 ### Watching it work: the demo
 
 `uv run python dev/demo.py` shows the guarantees with real processes. It needs PostgreSQL running,
-creates its own `webhooks_demo` database, starts a test receiver, the API and a worker on free
-ports with short timeouts, and plays four scenes in about 20 seconds:
+creates its own `webhooks_demo` database with two producers, carrental and friendster, and makes a
+webhook secret for the run. It then starts a test receiver, the API and a worker on free ports
+with short timeouts, and plays five scenes in about 20 seconds:
 
 | Scene | What happens | What it shows |
 |---|---|---|
@@ -135,6 +154,7 @@ ports with short timeouts, and plays four scenes in about 20 seconds:
 | 2 | The receiver is stopped. | `connection_error` attempts with growing waits, then delivery once the receiver is back. |
 | 3 | The receiver answers after 3 seconds; the worker waits 2. | A `timeout`, a retry, and the receiver processing the same `webhook-id` twice. |
 | 4 | The worker is killed with `SIGKILL` while it waits for the receiver. | The delivery stuck in `processing` until its claim expires, then `claim_expired` and delivery by a new worker. |
+| 5 | A request without a key; the same `Idempotency-Key` from both producers; friendster reading carrental's delivery; a 100 KB event. Then an attacker resends a captured webhook unchanged, with its body changed, with a new timestamp, and signed with a guessed secret. | `401`; two separate deliveries; `404`; `413`. The unchanged copy passes the signature check and is caught as a duplicate; the other three get `401`. |
 
 It prints each step, the worker's and the receiver's log lines, and each delivery's attempt
 history. The demo database is emptied at the start of every run and left in place afterwards, so
@@ -162,12 +182,18 @@ workers the same settings.
 Stop the workers, update the code, then run `uv sync` and `uv run alembic upgrade head` before
 starting the processes again. Migrations are versioned in `alembic/versions`.
 
+Milestone 5.1 (version 0.5.1) added API keys and signatures, so two more steps come before the
+restart: set `WEBHOOK_SECRETS` for the workers and the receiver, and create a producer and an API
+key for each app that submits events. Until a producer sends its key, its requests get `401`.
+Deliveries stored before the upgrade belong to the producer `legacy`, and are still delivered.
+
 ## 3. Submitting events
 
 ### The request
 
 ```http
 POST /deliveries
+Authorization: Bearer wds_t408ROrX...
 Content-Type: application/json
 Idempotency-Key: booking-42-confirmed
 
@@ -176,15 +202,22 @@ Idempotency-Key: booking-42-confirmed
 
 | Part | Rules |
 |---|---|
+| `Authorization` header | Required: `Bearer` and the producer's API key. See [Producers and API keys](#producers-and-api-keys). |
 | `event_type` | Required. 1 to 100 characters. Lowercase letters, digits and underscores, in parts joined by dots: `booking.confirmed`, `user_profile.updated`. |
 | `data` | Required. A JSON object. It is delivered as is, but stored as JSONB, so key order and whitespace are not kept. |
 | Other fields | Rejected. In particular, a producer cannot choose the destination URL. |
 | `Idempotency-Key` header | Optional, but recommended. 1 to 255 characters. See [Idempotency keys](#idempotency-keys). |
+| Size | The whole body may be at most `MAX_EVENT_BYTES` bytes, 65,536 by default. |
 
-With curl:
+Keep events small: send IDs and the facts a receiver needs, not whole records. The Standard
+Webhooks specification recommends payloads "usually smaller than 20kb", because every receiver
+pays for every byte, whether it needs the data or not.
+
+With curl, using the key from [First-time setup](#first-time-setup):
 
 ```bash
 curl -i -X POST http://127.0.0.1:8000/deliveries \
+  -H "Authorization: Bearer $API_KEY" \
   -H 'content-type: application/json' \
   -H 'Idempotency-Key: booking-42-confirmed' \
   -d '{"event_type": "booking.confirmed", "data": {"booking_id": 42, "car_id": 7}}'
@@ -215,10 +248,29 @@ idempotent-replayed: true
 {"delivery_id":"73731487-6839-4966-b9b2-9b2a1a83054c","status":"pending"}
 ```
 
-**`409 Conflict`**: this key was used before with *different* content.
+**`401 Unauthorized`**: the request has no API key, or the key is unknown or revoked. Nothing was
+stored.
+
+```http
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer
+
+{"detail": "Invalid API key"}
+```
+
+Without an `Authorization` header, `detail` says how to send the key. An unknown key and a revoked
+one get the same answer, so the answer does not reveal which keys exist.
+
+**`409 Conflict`**: this producer used the key before with *different* content.
 
 ```json
 {"detail": "This Idempotency-Key was already used for a different request"}
+```
+
+**`413 Content Too Large`**: the body is larger than `MAX_EVENT_BYTES`. Nothing was stored.
+
+```json
+{"detail": "The request body is larger than the limit of 65536 bytes"}
 ```
 
 **`422 Unprocessable Content`**: the request is invalid, and nothing was stored. `detail` says
@@ -263,7 +315,9 @@ as a replay.
 | `202` | Stored, now or by an earlier identical request. | Done. Mark the event as handed over. |
 | `503` | Not confirmed: usually not stored, but possibly stored just before the connection failed. | Wait at least `Retry-After` seconds, then retry with the same key. |
 | A timeout, a dropped connection or another 5xx | Unknown: it may or may not be stored. | Retry with the same key, waiting longer each time. |
+| `401` | The API key is missing, wrong or revoked. Nothing was stored. | Do not keep retrying: alert someone to fix the key. Events wait in the outbox meanwhile. |
 | `409` | The key was reused for different content. | Do not retry. This is a bug in how the producer builds keys. |
+| `413` | The event is larger than `MAX_EVENT_BYTES`. Nothing was stored. | Do not retry. Send less data. |
 | `422` | The request is invalid. | Do not retry. Fix the request. |
 
 ### Idempotency keys
@@ -289,7 +343,8 @@ To choose keys:
 - Good keys: the ID of the producer's outbox row, or `booking-42-confirmed-<booking version>`.
 - Bad keys: the booking ID alone, because it would be reused for `booking.cancelled` and rejected
   with `409`.
-- Keys are global for now and never expire. Milestone 5 is planned to scope them per producer.
+- Keys belong to the producer that sends them: two producers can use the same key without
+  affecting each other. Keys never expire.
 
 ### Recommended integration: the transactional outbox
 
@@ -317,15 +372,18 @@ sequenceDiagram
     end
 ```
 
-On `503`, timeouts and network errors, the relay leaves the row unsent and tries again later with
-the same key. On `409` or `422`, it should alert someone, because those mean a bug.
+The relay sends the producer's API key with every request. On `503`, timeouts and network errors,
+it leaves the row unsent and tries again later with the same key. On `401`, `409`, `413` or
+`422`, it should alert someone: the key is wrong or revoked, or the producer has a bug. The row
+stays unsent in the meantime, so nothing is lost while it is fixed.
 
 ## 4. Tracking deliveries
 
 ### `GET /deliveries/{delivery_id}`
 
 ```bash
-curl http://127.0.0.1:8000/deliveries/73731487-6839-4966-b9b2-9b2a1a83054c
+curl -H "Authorization: Bearer $API_KEY" \
+  http://127.0.0.1:8000/deliveries/73731487-6839-4966-b9b2-9b2a1a83054c
 ```
 
 This is the delivery from the worker log above. Its first attempt got a `500`, and the retry
@@ -393,8 +451,10 @@ Each attempt has:
 | `error_category` | `timeout`, `connection_error`, `http_error`, `claim_expired`, or `null`. |
 | `duration_ms` | Time until the receiver's status code arrived, or until the request failed. |
 
-An unknown ID returns `404` with `{"detail": "Delivery not found"}`. A malformed ID returns `422`.
-If the database is unavailable, it returns `503` with
+A producer can read only its own deliveries. An unknown ID returns `404` with
+`{"detail": "Delivery not found"}`, and so does the ID of another producer's delivery: the answer
+does not even confirm that the ID exists. A malformed ID returns `422`, a missing or invalid API
+key `401`, and if the database is unavailable, the answer is `503` with
 `{"detail": "Storage is unavailable. Retry later."}`.
 
 ### Reading the history
@@ -450,15 +510,18 @@ POST /webhooks
 content-type: application/json
 webhook-id: 73731487-6839-4966-b9b2-9b2a1a83054c
 webhook-timestamp: 1795476541
+webhook-signature: v1,lPzexW1LHchpWqMHICUwhzcH5Jo2FsZLjKP5xfY7g8E=
 
-{"type":"booking.confirmed","timestamp":"2026-11-23T23:28:50.230425Z","data":{"car_id":7,"booking_id":42}}
+{"type":"booking.confirmed","producer":"carrental","timestamp":"2026-11-23T23:28:50.230425Z","data":{"car_id":7,"booking_id":42}}
 ```
 
 | Part | Meaning |
 |---|---|
 | `webhook-id` | The delivery ID. **The same on every attempt.** Use it to detect duplicates. |
 | `webhook-timestamp` | When this attempt was sent, in Unix seconds. Here 23:29:01 UTC, the second attempt. |
+| `webhook-signature` | `v1,` and a signature, once per secret in `WEBHOOK_SECRETS`, separated by spaces. It covers the timestamp, so every attempt has a new one. See [Checking signatures](#checking-signatures). |
 | `type` | The producer's `event_type`. |
+| `producer` | The producer that submitted the event, such as `carrental`. Producers choose event types freely, so this is how a receiver knows who sent a `booking.confirmed`. |
 | `timestamp` | When the service accepted the event, in ISO 8601 UTC. It is the same on every attempt. |
 | `data` | The producer's `data`. |
 
@@ -477,13 +540,15 @@ arrives, without reading the body, so the body can be empty; anything in it is i
 
 So a receiver should:
 
-1. **Answer quickly.** Save the event, answer `200`, and do slow work afterwards. A slow answer
+1. **Check the signature first,** and answer `401` if it fails. See
+   [Checking signatures](#checking-signatures).
+2. **Answer quickly.** Save the event, answer `200`, and do slow work afterwards. A slow answer
    becomes a timeout, and a timeout becomes a resend.
-2. **Skip duplicates, but still answer `200`.** A duplicate is a success from the sender's point
+3. **Skip duplicates, but still answer `200`.** A duplicate is a success from the sender's point
    of view. Answering `409` would mark it `failed`, and `500` would keep it retrying.
-3. **Use 4xx only for events that can never succeed,** such as a payload it cannot parse. Use 5xx
+4. **Use 4xx only for events that can never succeed,** such as a payload it cannot parse. Use 5xx
    or `429` for temporary problems.
-4. **Not rely on order.** A retried `booking.confirmed` can arrive after a later
+5. **Not rely on order.** A retried `booking.confirmed` can arrive after a later
    `booking.cancelled`. Use the event's data and `timestamp`, not arrival order.
 
 ### Skipping duplicates
@@ -511,10 +576,146 @@ settings, and longer if operators may [replay](#replaying-a-failed-delivery) old
 Keeping them for a few days is a safe choice. CarRental already does the same for Stripe events,
 with its `stripe_events` table.
 
-### Security
+The same table stops replays. A captured webhook resent within the five minutes its timestamp
+allows passes the signature check, but its `webhook-id` has been processed already.
 
-Webhooks are not signed yet; signing is planned for milestone 5, using Standard Webhooks
-signatures. Until then, only expose the receiver to the network the service runs on.
+### Checking signatures
+
+Every webhook is signed as the [Standard Webhooks](https://www.standardwebhooks.com) specification
+describes, so a receiver can tell a real webhook from a forged, changed or replayed one. The
+signature is an HMAC-SHA256 of three parts joined by dots:
+
+```text
+{webhook-id}.{webhook-timestamp}.{the body, byte for byte}
+```
+
+The key is the part of the secret after `whsec_`, decoded from base64. The header holds `v1,` and
+the signature in base64, once for each secret the workers have, separated by spaces.
+
+To check a webhook:
+
+1. **Keep the raw body.** Check the bytes that arrived, before parsing the JSON. Parsing and
+   encoding it again can change spacing or key order, and then no signature matches.
+2. **Check the timestamp.** Refuse a `webhook-timestamp` more than five minutes away from your
+   clock, so a captured webhook cannot be replayed later.
+3. **Compute the signature** with each secret you have, and compare it with each signature in the
+   header, in constant time. Accept the webhook if any pair matches.
+4. **Then parse the JSON, and skip `webhook-id`s you have processed** (see
+   [Skipping duplicates](#skipping-duplicates)).
+
+Each signed part closes a gap:
+
+| Signed part | An attacker who changes it, to… | Is stopped because |
+|---|---|---|
+| The body | …change the event, say its `booking_id` | the signature no longer matches. |
+| `webhook-timestamp` | …replay an old webhook with a fresh timestamp | the signature no longer matches, and without a fresh timestamp the age check refuses it. |
+| `webhook-id` | …replay a webhook under a new ID, past the duplicate check | the signature no longer matches. |
+
+A webhook resent unchanged within five minutes passes the signature and age checks, which is why
+the duplicate check is part of verification, not an extra.
+
+Answer `401` when the check fails. The service treats it like any other 4xx: the delivery fails at
+once, without retries, because sending the same webhook again cannot fix secrets that do not
+match. Once they are fixed, [replay](#replaying-a-failed-delivery) the failed deliveries.
+
+**In TypeScript,** with Node's built-in `crypto`:
+
+```ts
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const TOLERANCE_SECONDS = 5 * 60;
+
+// Throws unless the webhook is signed with one of the secrets and is recent.
+// rawBody must be the body exactly as it arrived, before any JSON parsing.
+export function verifyWebhook(
+  secrets: string[],
+  headers: Record<string, string | string[] | undefined>,
+  rawBody: Buffer,
+  nowSeconds = Date.now() / 1000,
+): void {
+  const id = headers["webhook-id"];
+  const timestamp = headers["webhook-timestamp"];
+  const signatures = headers["webhook-signature"];
+  if (typeof id !== "string" || typeof timestamp !== "string" || typeof signatures !== "string") {
+    throw new Error("missing webhook headers");
+  }
+  if (!/^\d+$/.test(timestamp) || Math.abs(nowSeconds - Number(timestamp)) > TOLERANCE_SECONDS) {
+    throw new Error("timestamp too old or too new");
+  }
+  const signedContent = Buffer.concat([Buffer.from(`${id}.${timestamp}.`), rawBody]);
+  const expected = secrets.map((secret) => {
+    const key = Buffer.from(secret.replace(/^whsec_/, ""), "base64");
+    const digest = createHmac("sha256", key).update(signedContent).digest("base64");
+    return Buffer.from(`v1,${digest}`);
+  });
+  const matches = signatures.split(" ").some((signature) => {
+    const given = Buffer.from(signature);
+    return expected.some((e) => e.length === given.length && timingSafeEqual(e, given));
+  });
+  if (!matches) {
+    throw new Error("no signature matches");
+  }
+}
+```
+
+In an Express app such as CarRental, mount the route with `express.raw()`, so the body arrives as
+a `Buffer`, as CarRental already does for Stripe:
+
+```ts
+webhookRoutes.post("/delivery-service", express.raw({ type: "application/json" }), (req, res) => {
+  try {
+    verifyWebhook(process.env.WEBHOOK_SECRETS!.split(" "), req.headers, req.body);
+  } catch {
+    res.sendStatus(401);
+    return;
+  }
+  const event = JSON.parse(req.body.toString("utf8"));
+  // Record req.headers["webhook-id"] and do the work in one transaction, then:
+  res.sendStatus(200);
+});
+```
+
+**In Python,** with the specification's own library (`pip install standardwebhooks`), here in a
+FastAPI app:
+
+```python
+import os
+
+from fastapi import FastAPI, Request, Response
+from standardwebhooks.webhooks import Webhook, WebhookVerificationError
+
+# One Webhook per secret: during a rotation, the receiver may know two.
+verifiers = [Webhook(secret) for secret in os.environ["WEBHOOK_SECRETS"].split()]
+app = FastAPI()
+
+
+@app.post("/webhooks")
+async def receive_webhook(request: Request) -> Response:
+    body = await request.body()  # the raw bytes, before any JSON parsing
+    for verifier in verifiers:
+        try:
+            event = verifier.verify(body, dict(request.headers))
+            break
+        except WebhookVerificationError:
+            continue
+    else:
+        return Response(status_code=401)
+    # Record request.headers["webhook-id"] and do the work in one transaction, then:
+    return Response(status_code=200)
+```
+
+Libraries for other languages are listed on [standardwebhooks.com](https://www.standardwebhooks.com).
+Both examples above, and the official Python and JavaScript libraries, were checked against
+signatures made by this service: they accept real webhooks, including the two-signature webhooks
+of a rotation, and refuse a changed body, another secret, an old timestamp and a refreshed one.
+The service's own implementation is `src/webhook_service/signing.py`.
+
+During a [secret rotation](#rotating-the-webhook-secret), each webhook carries two signatures, one
+per secret. A receiver that has either secret accepts it, so it can switch at any point while both
+are sent.
+
+A signature proves who sent a webhook and that it was not changed, but it does not hide its
+content. In production, the receiver should use HTTPS.
 
 ### The test receiver
 
@@ -522,7 +723,13 @@ signatures. Until then, only expose the receiver to the network the service runs
 
 ```bash
 uv run python dev/receiver.py [--mode ok|slow|error|reject] [--port 9000] [--slow-seconds 10]
+                              [--secret whsec_...]
 ```
+
+It checks every webhook's signature with the secrets in `WEBHOOK_SECRETS`, from the environment or
+`.env`, or with the ones given with `--secret`, which can be repeated. A webhook that fails the
+check gets `401` and is not processed. With no secret at all, it logs a warning and accepts
+everything.
 
 | Mode | Behaviour |
 |---|---|
@@ -533,9 +740,9 @@ uv run python dev/receiver.py [--mode ok|slow|error|reject] [--port 9000] [--slo
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /webhooks` | Receives webhooks and logs `processed (first time)` or `processed (DUPLICATE)`. |
+| `POST /webhooks` | Checks the signature, then receives the webhook and logs `processed (first time)` or `processed (DUPLICATE)`. |
 | `PUT /mode/{mode}` | Switches the mode without a restart: `curl -X PUT localhost:9000/mode/slow`. |
-| `GET /received` | Every processed `webhook-id`, with how many times it was processed. |
+| `GET /received` | Every processed `webhook-id`, with how many times it was processed, its payload, and the latest copy exactly as it arrived (the signed headers and the raw body), for replay experiments. |
 
 Its log for the delivery above, where the mode was switched from `error` to `ok` between the
 attempts:
@@ -543,8 +750,12 @@ attempts:
 ```text
 01:28:50 [receiver] 73731487-6839-4966-b9b2-9b2a1a83054c -> 500 (mode=error, not processed)
 01:28:55 [receiver] mode set to ok
-01:29:01 [receiver] 73731487-6839-4966-b9b2-9b2a1a83054c processed (first time) type=booking.confirmed
+01:29:01 [receiver] 73731487-6839-4966-b9b2-9b2a1a83054c processed (first time) type=booking.confirmed producer=carrental
 ```
+
+A webhook that fails the signature check is logged as
+`<webhook-id> -> 401 (signature check failed: no signature matches)`, or with the reason
+`the timestamp is too old or too far in the future`.
 
 ## 6. How a delivery flows
 
@@ -552,14 +763,18 @@ This section follows one event from submission to its final state.
 
 ### 6.1 Submission
 
-1. The API validates the body. An invalid body gets `422`, and nothing is stored.
-2. Without a key, it inserts a `pending` delivery and commits. With a key, it inserts with
-   `ON CONFLICT DO NOTHING`:
-   - a new key is stored;
-   - a known key with the same content returns the original delivery;
-   - a known key with different content gets `409`.
-3. Only after the commit does it answer `202`, with the delivery ID and a `Location` header. If
-   the database cannot be reached, it answers `503` and nothing is accepted.
+1. While the body arrives, the API counts its bytes. A body larger than `MAX_EVENT_BYTES` gets
+   `413` before it is read into memory.
+2. It looks up the hash of the API key. A missing, unknown or revoked key gets `401`.
+3. It validates the body. An invalid body gets `422`, and nothing is stored. A body that is not
+   JSON at all gets its `422` while it is read, before the key is checked.
+4. Without an `Idempotency-Key`, it inserts a `pending` delivery for the producer and commits.
+   With one, it inserts with `ON CONFLICT DO NOTHING` on the producer and the key:
+   - a key the producer has not used is stored;
+   - a key the producer used with the same content returns the original delivery;
+   - a key the producer used with different content gets `409`.
+5. Only after the commit does it answer `202`, with the delivery ID and a `Location` header. If
+   the database cannot be reached, it answers `503`, and the producer retries with the same key.
 
 The new delivery is `pending`, with `attempt_count` 0 and `next_attempt_at` set to now, so it is
 due immediately.
@@ -575,8 +790,9 @@ Each worker repeats this loop:
    - marks the delivery `processing` and adds 1 to `attempt_count`;
    - opens an attempt row and stores its ID as the delivery's claim token;
    - moves `next_attempt_at` to now plus `CLAIM_TIMEOUT_SECONDS`, the moment the claim expires.
-2. **Send.** It posts the webhook with no transaction open, and reads only the status code.
-   Nothing in the database is locked while the receiver thinks.
+2. **Send.** It signs the webhook with every secret in `WEBHOOK_SECRETS`, posts it with no
+   transaction open, and reads only the status code. Nothing in the database is locked while the
+   receiver thinks.
 3. **Record.** In a new short transaction, it locks the delivery again, but only if the claim
    token is still its own. An expired claim still counts as its own until another worker takes
    the delivery over. If the token changed, another worker took over, and this worker discards
@@ -659,7 +875,9 @@ Environment variables win. Copy `.env.example` to start.
 
 | Variable | Default | Used by | Meaning |
 |---|---|---|---|
-| `DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks` | API, worker, migrations | PostgreSQL connection. |
+| `DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks` | API, worker, migrations, `webhook-admin` | PostgreSQL connection. |
+| `MAX_EVENT_BYTES` | `65536` | API | The largest request body the API reads, in bytes. A larger one gets `413`. |
+| `WEBHOOK_SECRETS` | none | Worker, test receiver | Secrets to sign webhooks with, separated by spaces. Each is `whsec_` and 24 to 64 random bytes in base64; `uv run webhook-admin new-webhook-secret` makes one. The worker does not start without one. Two only during a [rotation](#rotating-the-webhook-secret). |
 | `RECEIVER_URL` | `http://127.0.0.1:9000/webhooks` | Worker | The only destination. Deliveries waiting for a retry go to the value a worker has when it sends them, so changing it moves them to the new receiver. Give every worker the same value. |
 | `DELIVERY_TIMEOUT_SECONDS` | `5` | Worker | How long each network step of an attempt may take: connecting, sending, and waiting for the status code. It does not limit the attempt as a whole. |
 | `MAX_ATTEMPTS` | `8` | Worker | Attempts per delivery before it is marked `failed`. |
@@ -668,6 +886,10 @@ Environment variables win. Copy `.env.example` to start.
 | `CLAIM_TIMEOUT_SECONDS` | `60` | Worker | How long a claim lasts. Must be at least 3 × `DELIVERY_TIMEOUT_SECONDS`, or the worker refuses to start. |
 | `POLL_INTERVAL_SECONDS` | `1` | Worker | How often an idle worker looks for due deliveries. |
 | `TEST_DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks_test` | Tests | Database for integration tests. It is created and migrated automatically. The tests delete all its data, so its name must end in `_test`, and it must not be the database `DATABASE_URL` names. |
+
+An invalid setting stops the API and the worker at startup. The message names the setting and the
+problem but never repeats the value, because some values are secrets: `WEBHOOK_SECRETS`, and the
+password in `DATABASE_URL`.
 
 Some guidance:
 
@@ -683,6 +905,59 @@ Some guidance:
 
 ## 8. Operating the service
 
+### Producers and API keys
+
+`webhook-admin` manages producers and their keys. It works on the database directly, as the
+migrations do, so it needs `DATABASE_URL` but not a running API.
+
+```bash
+uv run webhook-admin create-producer friendster   # a new producer and its first API key
+uv run webhook-admin create-key carrental          # another key for an existing producer
+uv run webhook-admin list                          # producers and their keys
+uv run webhook-admin revoke-key wds_t408ROrX       # refuse a key from the next request on
+```
+
+`list` shows the start of each key, never a whole key:
+
+```text
+carrental
+  wds_t408ROrX...  created 2026-11-25 20:41 UTC  active
+friendster
+  wds_q9Vj9Jw3...  created 2026-11-25 20:41 UTC  active
+```
+
+- **A key is shown once,** when it is created. The database keeps only its SHA-256 hash and its
+  first 12 characters, so nobody can read a key back, not even from a copy of the database. A lost
+  key is replaced, not recovered.
+- **To replace a key without downtime,** create a new one, give it to the producer, and revoke the
+  old one once no instance of the producer uses it any more. Both keys work in between.
+- **If a key leaks,** revoke it at once, then create a new one. Deliveries submitted with it stay
+  stored and are delivered.
+- **Names** are lower-case letters, digits, `-` and `_`, such as `carrental`. Receivers see the
+  name in every webhook, so choose it once.
+- **Keys start with `wds_`,** so a leaked key is easy to spot in code or logs, by people and by
+  secret scanners.
+- **Deliveries stored before milestone 5.1** belong to a producer named `legacy`, which the
+  migration created. It has no keys. To read those deliveries through the API, run
+  `uv run webhook-admin create-key legacy`.
+
+### Rotating the webhook secret
+
+Replace the secret now and then, and at once if it may have leaked: anyone who has it can sign
+webhooks that the receiver will trust. Workers sign every webhook with every secret in
+`WEBHOOK_SECRETS`, so for a while they sign with both the old and the new one:
+
+1. Create a new secret: `uv run webhook-admin new-webhook-secret`.
+2. Set `WEBHOOK_SECRETS="<old secret> <new secret>"` for the workers, and restart them one at a
+   time. Each finishes its current delivery before it stops. Webhooks now carry two signatures.
+3. Give the receiver the new secret. Whichever of the two secrets it has, one signature matches.
+4. Set `WEBHOOK_SECRETS="<new secret>"` for the workers, and restart them again.
+
+No webhook fails at any step. If the receiver switches to the new secret before every worker signs
+with it, webhooks get `401` and fail at once. Give the workers both secrets, then
+[replay](#replaying-a-failed-delivery) the failed deliveries. The test receiver reads
+`WEBHOOK_SECRETS` too, so locally both sides change together.
+
 ### Checking health with SQL
 
 Connect with `docker compose exec db psql -U webhooks`.
@@ -690,6 +965,11 @@ Connect with `docker compose exec db psql -U webhooks`.
 ```sql
 -- How many deliveries are in each state?
 SELECT status, count(*) FROM deliveries GROUP BY status ORDER BY status;
+
+-- The same, per producer.
+SELECT p.name, d.status, count(*)
+FROM deliveries d JOIN producers p ON p.id = d.producer_id
+GROUP BY 1, 2 ORDER BY 1, 2;
 
 -- How far behind are the workers? The age of the oldest delivery that is due but not sent.
 SELECT now() - min(next_attempt_at) AS oldest_due_waiting
@@ -731,16 +1011,20 @@ so in rare cases it is another source of duplicates.
 |---|---|---|
 | `POST` returns `503` | PostgreSQL is unreachable. | Run `docker compose ps` and start the database. Producers retry by themselves, with the same key. |
 | `POST` returns `503` after about 30 seconds while the database is up | Every pooled database connection is busy. | The API or the database is overloaded. Producers retry; add capacity if it persists. |
+| Every request gets `401` | The API key is missing, mistyped or revoked, or was created in another database. | Run `uv run webhook-admin list` with the API's `DATABASE_URL`, and create a new key if needed. |
+| `POST` returns `413` | The event is larger than `MAX_EVENT_BYTES`. | Send less data, such as IDs, or raise the limit. |
 | Deliveries stay `pending`, and `oldest_due_waiting` grows | No worker is running, or workers cannot reach the database. | Start workers and read their logs. |
 | Many `connection_error` attempts | The receiver is down, or `RECEIVER_URL` is wrong. | Fix the receiver. Deliveries retry by themselves until `MAX_ATTEMPTS`. |
 | Many `timeout` attempts | The receiver is slow. | Make it answer before doing slow work. Raise the timeouts only if that is not possible. |
 | `permanent_failure` with a 4xx | The receiver rejects the event. | Fix the receiver or the producer, then replay. |
+| `permanent_failure` with `401` | The receiver refused the signature: it has none of the secrets the workers sign with. | Give both sides the same secret, as in [Rotating the webhook secret](#rotating-the-webhook-secret), then replay. |
 | A delivery is `processing` for a long time | A worker is sending it, or crashed while doing so. | Wait `CLAIM_TIMEOUT_SECONDS`; another worker takes over by itself. |
 | `claim_expired` in a history | A worker crashed or froze mid-attempt. | Check that worker's health. The receiver may have a duplicate. |
 | A worker logs `unexpected error` with a traceback | A bug, or a row edited by hand. | Read the traceback. The worker carries on, and the delivery it held is sent again when its claim expires. |
 | `409` on submit | A producer reused a key for different content. | Fix how the producer builds keys. |
 | `422` on submit | The request is invalid. | Read `detail` and fix the producer. |
-| The worker exits at start with a validation error | A setting is invalid, for example `CLAIM_TIMEOUT_SECONDS` is too small. | Fix the setting. |
+| The worker or the API exits at start with a validation error; the API also logs `Application startup failed` | A setting is invalid, for example `CLAIM_TIMEOUT_SECONDS` is too small or a secret is malformed. The message names the setting, not its value. | Fix the setting. |
+| The worker exits at start: `WEBHOOK_SECRETS is not set` | No webhook secret is configured. | See [First-time setup](#first-time-setup). |
 
 ### Replaying a failed delivery
 
@@ -772,32 +1056,42 @@ deliveries (their attempts are deleted with them) is future work.
 
 ## 9. Limitations
 
-- One receiver. Producers cannot choose destinations, by design.
-- Producers are not authenticated, so all producers share one space of idempotency keys.
-- Keys never expire.
-- Webhooks are not signed.
+- One receiver, with one set of webhook secrets. Producers cannot choose destinations, by design.
+- No rate limit per producer: a producer with a valid key can submit as fast as the database
+  accepts.
+- API keys do not expire, and the service does not record when a key was last used.
+- Idempotency keys never expire.
 - No metrics or structured logs yet; use the SQL queries above.
 - No replay endpoint and no cleanup of old rows.
-- The size of `data` is not limited.
 - No deadline for a whole attempt: a receiver that sends its status line a few bytes at a time can
   outlast the claim, which causes a duplicate.
 - No ordering guarantee.
+- HTTPS is left to the deployment: a reverse proxy in front of the API, and an `https://`
+  `RECEIVER_URL`.
 
-Most of these are planned for milestone 5; see [ARCHITECTURE.md](../ARCHITECTURE.md#limitations-and-future-work).
+Several of these are planned for the rest of milestone 5; see
+[ARCHITECTURE.md](../ARCHITECTURE.md#limitations-and-future-work).
 
 ## 10. Glossary
 
 | Term | Meaning |
 |---|---|
+| API key | A producer's credential, sent as a bearer token. The service stores only its SHA-256 hash. |
 | At least once | Every event is delivered, possibly more than once, as long as the receiver accepts it within the retry window. The opposite trade-off, at most once, risks losing events. |
 | Backoff | Waiting longer after each failure. |
+| Bearer token | A credential sent as `Authorization: Bearer <token>`. Whoever holds it is let in, so it must stay secret. |
 | Claim | A worker's temporary, expiring ownership of a delivery. |
 | Claim token | The ID of the attempt holding the claim. Only the holder may save a result. In general this is called a fencing token. It guards the database, not the receiver. |
 | Claim timeout | How long a claim lasts. After that, another worker may take the delivery over; until one does, the original worker's result is still accepted. Message queues call this a visibility timeout. |
+| Constant-time comparison | Comparing two values in a time that does not depend on where they differ, so response times do not tell an attacker how close a guess is. |
 | Fingerprint | A hash of a request's content, used to detect a key reused with different content. |
+| HMAC | A hash computed with a secret key. Only a holder of the key can compute it, so a matching HMAC proves who sent the content and that it did not change. |
 | Idempotency key | A producer-chosen name for a request, so that repeating it has no extra effect. |
 | Jitter | Randomness added to retry waits so that many retries do not happen at the same moment. |
 | Outbox | A table where a producer saves events in the same transaction as the change that caused them, for a relay to send later. |
 | Poison delivery | A delivery that fails or crashes every attempt. Attempt limits stop it. |
+| Replay attack | Resending a captured, genuine request. A signature alone does not stop it; the age check and the `webhook-id` check do. |
+| Secret rotation | Replacing a secret without downtime, by signing with, or accepting, both the old and the new one for a while. |
 | `SKIP LOCKED` | PostgreSQL's option to pass over rows another transaction has locked, instead of waiting. |
 | `webhook-id` | The delivery ID, sent with every attempt so that receivers can detect duplicates. |
+| Webhook secret | The `whsec_` secret that workers sign webhooks with and the receiver checks them with. |

@@ -74,5 +74,8 @@ class WebhookMessage(BaseModel):
     """The JSON body the receiver gets, in the shape the Standard Webhooks spec recommends."""
 
     type: str
+    # Which producer submitted the event. Producers choose their event types freely, so this,
+    # covered by the signature, is how a receiver knows who sent, say, booking.confirmed.
+    producer: str
     timestamp: datetime
     data: dict[str, Any]

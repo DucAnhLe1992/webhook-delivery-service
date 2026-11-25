@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/DucAnhLe1992/webhook-delivery-service/actions/workflows/ci.yml/badge.svg)](https://github.com/DucAnhLe1992/webhook-delivery-service/actions/workflows/ci.yml)
 
-A Python service that accepts events from producer apps, such as
-[CarRental](https://github.com/DucAnhLe1992/CarRental), and reliably delivers them as webhooks to
-a receiver.
+A Python service that accepts events from authenticated producer apps, such as
+[CarRental](https://github.com/DucAnhLe1992/CarRental), and reliably delivers them to a receiver as
+signed webhooks.
 
 The focus is explicit, tested guarantees rather than the number of endpoints: what survives a
 crash, what can be repeated, and what happens when the receiver is slow, down or answers with an
@@ -33,21 +33,33 @@ error.
   reads the response body, so no answer can exhaust its memory, hold it up or crash it.
 - **Any number of workers.** `FOR UPDATE SKIP LOCKED` lets workers share the queue without
   waiting for each other. Race tests use real PostgreSQL locks and do not depend on timing.
+- **Authenticated, isolated producers.** Each producer app has its own revocable API keys, stored
+  only as SHA-256 hashes. A producer sees only its own deliveries and idempotency keys; another
+  producer's delivery is a `404`, exactly like one that does not exist.
+- **Signed webhooks.** Every attempt is signed as Standard Webhooks specifies, over the
+  `webhook-id`, the timestamp and the exact body, so receivers can refuse forged, changed and
+  replayed webhooks. Signing with two secrets at once makes rotation free of downtime. The
+  signatures match the specification's reference example and verify with its official Python and
+  JavaScript libraries.
+- **Bounded input, quiet secrets.** Bodies over `MAX_EVENT_BYTES` get `413` before they are read
+  into memory, and an invalid setting stops the processes at startup without printing secrets.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    P[Producer] -->|"POST /deliveries"| API[API]
+    P[Producer] -->|"POST /deliveries with an API key"| API[API]
     API -->|"INSERT and COMMIT, then 202"| DB[(PostgreSQL)]
     W[Workers] -->|"claim, then record"| DB
-    W -->|"POST with webhook-id"| R[Receiver]
+    W -->|"signed POST with webhook-id"| R[Receiver]
 ```
 
-1. The **API** validates the event, stores it as a `pending` delivery, commits, and answers `202`.
+1. The **API** checks the producer's API key, validates the event, stores it as a `pending`
+   delivery of that producer, commits, and answers `202`.
 2. A **worker** claims the oldest due delivery in a short transaction. The claim opens an attempt
    and expires after `CLAIM_TIMEOUT_SECONDS`.
-3. The worker sends the webhook with no transaction open, and reads only the status code.
+3. The worker signs the webhook, sends it with no transaction open, and reads only the status
+   code.
 4. It saves the result only if it still holds the claim. The delivery becomes `delivered`, goes
    back to `pending` with a growing delay, or becomes `failed`.
 
@@ -63,6 +75,8 @@ You need Python 3.12+, [uv](https://docs.astral.sh/uv/) and Docker.
 uv sync
 docker compose up -d --wait   # PostgreSQL on localhost:5433
 uv run alembic upgrade head   # create or update the tables
+echo "WEBHOOK_SECRETS=$(uv run webhook-admin new-webhook-secret)" >> .env   # to sign webhooks
+API_KEY=$(uv run webhook-admin create-producer carrental)   # printed once, so keep it
 ```
 
 Start each process in its own terminal:
@@ -77,6 +91,7 @@ Submit an event:
 
 ```bash
 curl -i -X POST http://127.0.0.1:8000/deliveries \
+  -H "Authorization: Bearer $API_KEY" \
   -H 'content-type: application/json' \
   -H 'Idempotency-Key: booking-42-confirmed' \
   -d '{"event_type": "booking.confirmed", "data": {"booking_id": 42, "car_id": 7}}'
@@ -89,35 +104,52 @@ location: /deliveries/73731487-6839-4966-b9b2-9b2a1a83054c
 {"delivery_id":"73731487-6839-4966-b9b2-9b2a1a83054c","status":"pending"}
 ```
 
-Then follow it with `curl http://127.0.0.1:8000/deliveries/<delivery_id>`, which shows its status
-and every attempt. Interactive API docs are at http://127.0.0.1:8000/docs.
+Then follow it with `curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8000/deliveries/<delivery_id>`,
+which shows its status and every attempt. The test receiver logs each webhook after checking its
+signature. Interactive API docs are at http://127.0.0.1:8000/docs.
 
 ### See the guarantees in action
 
 `uv run python dev/demo.py` starts its own receiver, API and worker against a separate
-`webhooks_demo` database and plays four scenes in about 20 seconds: a repeated request, a receiver
-that is down, an answer that comes too late, and a worker killed in the middle of a delivery.
-The last scene:
+`webhooks_demo` database and plays five scenes in about 20 seconds: a repeated request, a receiver
+that is down, an answer that comes too late, a worker killed in the middle of a delivery, and two
+producers and an attacker testing the trust checks. Two of them, shortened:
 
 ```text
 Scene 4: a worker dies in the middle of a delivery
-    21:57:35  receiver  3f6daa35 processed (first time) type=booking.confirmed
+    22:51:43  receiver  380f255b processed (first time) type=booking.confirmed producer=carrental
   Killed the worker while it was waiting for the receiver's answer.
   The delivery is processing, and attempt 1 has no result: nobody is left to save it.
   Started a new worker.
-    21:57:41  receiver  3f6daa35 processed (DUPLICATE) type=booking.confirmed
-    21:57:41  worker-2  3f6daa35 attempt 2: delivered (HTTP 200, 2 ms)
-  GET /deliveries/3f6daa35: delivered
+    22:51:49  receiver  380f255b processed (DUPLICATE) type=booking.confirmed producer=carrental
+    22:51:49  worker-2  380f255b attempt 2: delivered (HTTP 200, 2 ms)
+  GET /deliveries/380f255b: delivered
     attempt 1  + 0.0 s  retryable_failure  claim_expired
-    attempt 2  + 6.0 s  delivered          HTTP 200
+    attempt 2  + 6.1 s  delivered          HTTP 200
+
+Scene 5: who may submit, who may read, and who sent a webhook
+  POST without an API key                     -> 401
+  carrental:  POST, Idempotency-Key event-5   -> 202, 3ca4de51
+  friendster: POST, Idempotency-Key event-5   -> 202, b1b5856e, not a replay
+  friendster: GET carrental's 3ca4de51        -> 404, as for an ID that does not exist
+  carrental:  POST a 100 KB event             -> 413
+  ...
+    22:51:51  receiver  3ca4de51 processed (DUPLICATE) type=booking.confirmed producer=carrental
+  Attacker sends it again, unchanged          -> 200
+    22:51:51  receiver  3ca4de51 -> 401 (signature check failed: no signature matches)
+  Attacker changes booking_id in the body     -> 401
+  Attacker gives it a new timestamp           -> 401
+  Attacker signs it with a guessed secret     -> 401
 ```
 
 ## API
 
+Both `/deliveries` endpoints need the producer's API key, as `Authorization: Bearer <key>`.
+
 | Request | Answers |
 |---|---|
-| `POST /deliveries` | `202` stored (or replayed, with `Idempotent-Replayed: true`), `409` key reused for different content, `422` invalid request, `503` storage unavailable, so whether it was stored is unknown: retry with the same key |
-| `GET /deliveries/{id}` | `200` with the status and every attempt, `404` unknown ID, `422` malformed ID, `503` storage unavailable |
+| `POST /deliveries` | `202` stored (or replayed, with `Idempotent-Replayed: true`), `401` missing or invalid API key, `409` key reused for different content, `413` body larger than `MAX_EVENT_BYTES`, `422` invalid request, `503` storage unavailable, so whether it was stored is unknown: retry with the same key |
+| `GET /deliveries/{id}` | `200` with the status and every attempt, `401` missing or invalid API key, `404` unknown ID or another producer's delivery, `422` malformed ID, `503` storage unavailable |
 | `GET /health` | `200` while the API process is up |
 
 The receiver gets one `POST` per attempt:
@@ -127,9 +159,14 @@ POST /webhooks
 content-type: application/json
 webhook-id: 73731487-6839-4966-b9b2-9b2a1a83054c
 webhook-timestamp: 1795476541
+webhook-signature: v1,lPzexW1LHchpWqMHICUwhzcH5Jo2FsZLjKP5xfY7g8E=
 
-{"type":"booking.confirmed","timestamp":"2026-11-23T23:28:50.230425Z","data":{"car_id":7,"booking_id":42}}
+{"type":"booking.confirmed","producer":"carrental","timestamp":"2026-11-23T23:28:50.230425Z","data":{"car_id":7,"booking_id":42}}
 ```
+
+The receiver checks `webhook-signature` with the secret it shares with the workers, using any
+Standard Webhooks library or the tested TypeScript and Python examples in the
+[user manual](docs/USER_MANUAL.md#checking-signatures).
 
 | Receiver answers | The delivery |
 |---|---|
@@ -158,9 +195,15 @@ how receivers should answer and drop duplicates.
 5. **Bounded retries:** at most `MAX_ATTEMPTS` attempts. With the defaults, the last one comes
    about 21 minutes after the first.
 6. **No ordering guarantee:** a retried event can arrive after a newer one.
+7. **Authenticity:** every webhook is signed over its ID, timestamp and body. A receiver that
+   checks the signature, the timestamp and the ID accepts genuine webhooks, and refuses forged,
+   changed and replayed ones.
+8. **Isolation:** a producer can read only its own deliveries, and its idempotency keys cannot
+   collide with another producer's.
 
 How each failure is handled, from a crashed API to a frozen worker, is listed in
-[ARCHITECTURE.md](ARCHITECTURE.md#guarantees-and-failure-modes).
+[ARCHITECTURE.md](ARCHITECTURE.md#guarantees-and-failure-modes), and what the security model does
+and does not cover in [its security section](ARCHITECTURE.md#security-model).
 
 ## Configuration
 
@@ -168,7 +211,9 @@ Set environment variables, or copy `.env.example` to `.env`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks` | Used by the API, the worker and migrations. |
+| `DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks` | Used by the API, the worker, migrations and `webhook-admin`. |
+| `MAX_EVENT_BYTES` | `65536` | The largest request body the API reads. A larger one gets `413`. |
+| `WEBHOOK_SECRETS` | none | Secrets to sign webhooks with, separated by spaces (two during a rotation). `uv run webhook-admin new-webhook-secret` makes one. The worker does not start without one. |
 | `RECEIVER_URL` | `http://127.0.0.1:9000/webhooks` | The only destination. Producers cannot choose a URL. Deliveries waiting for a retry go to the current value, so every worker needs the same one. |
 | `DELIVERY_TIMEOUT_SECONDS` | `5` | How long each network step of an attempt may take: connecting, sending, and waiting for the status code. It does not limit the attempt as a whole. |
 | `MAX_ATTEMPTS` | `8` | Attempts per delivery before it is marked `failed`. |
@@ -185,7 +230,7 @@ uv run pytest              # all tests; integration tests need PostgreSQL
 uv run pytest tests/unit   # only the tests that need no database
 uv run ruff check .        # lint
 uv run ruff format .       # format
-uv run python dev/demo.py  # the four scenes, with real processes
+uv run python dev/demo.py  # the five scenes, with real processes
 ```
 
 Integration tests create a `webhooks_test` database on the same server and run the real
@@ -209,19 +254,24 @@ service.
 
 ```text
 src/webhook_service/
-  main.py                       API app, 503 when storage is down, /health
-  config.py                     settings from the environment
+  main.py                       API app, settings check at startup, 503 when storage is down
+  config.py                     settings from the environment, never echoed in errors
   db.py                         database engine and per-request session
   domain.py                     delivery states and attempt outcomes, shared by every layer
-  models.py                     deliveries and delivery_attempts tables
+  models.py                     producers, api_keys, deliveries and delivery_attempts tables
   schemas.py                    request, response and webhook message models
   services/delivery_service.py  create (idempotent), read, claim and record; owns the transactions
-  api/deliveries.py             POST and GET /deliveries
+  services/producer_service.py  producers and API keys: create, hash, look up, revoke
+  api/dependencies.py           the database session and the producer behind the API key
+  api/body_limit.py             413 for bodies over MAX_EVENT_BYTES, before they are read
+  api/deliveries.py             POST and GET /deliveries, scoped to the producer
   worker/main.py                the worker loop: claim, send, record
-  sender.py                     sends one attempt and classifies it by status code
+  sender.py                     signs and sends one attempt, classifies it by status code
+  signing.py                    Standard Webhooks signatures: sign, verify, secrets
   retry.py                      growing, capped, randomized retry delays
+  admin.py                      the webhook-admin command for producers, keys and secrets
 alembic/versions/               database migrations
-dev/receiver.py                 test receiver with ok / slow / error / reject modes
+dev/receiver.py                 test receiver that checks signatures; ok / slow / error / reject
 dev/demo.py                     scripted demonstration with real processes
 tests/unit/                     tests that need no database, including real-HTTP sender tests
 tests/integration/              tests against real PostgreSQL, including race tests
@@ -233,12 +283,12 @@ docs/                           user manual and build history
 | Document | What it covers |
 |---|---|
 | [User manual](docs/USER_MANUAL.md) | Running the service, submitting and tracking events, receiving webhooks, how a delivery flows step by step, configuration, operating and troubleshooting. |
-| [Architecture](ARCHITECTURE.md) | Components, data model, state machine, sequence diagrams, locking, retry policy, failure modes and design decisions. |
+| [Architecture](ARCHITECTURE.md) | Components, data model, state machine, sequence diagrams, locking, retry policy, security model, failure modes and design decisions. |
 | [How it was built](docs/MILESTONES.md) | The milestones, the experiments that motivated each one, and what they taught. |
 
 ## Status
 
-Milestones 1 to 4.1 are done, and each is tagged (`milestone-1` to `milestone-4.1`).
+Milestones 1 to 5.1 are done, and each is tagged (`milestone-1` to `milestone-5.1`).
 
 - [x] **1. Send it now.** Direct delivery during the request, to learn what can go wrong.
 - [x] **2. Store before acknowledging.** `202` only after commit, `503` otherwise.
@@ -248,10 +298,16 @@ Milestones 1 to 4.1 are done, and each is tagged (`milestone-1` to `milestone-4.
 - [x] **4.1. Tighter guarantees.** After an external review: honest `503` answers, a sender that
   reads only the status code, a worker no answer can crash, a hard retry cap, a guarded test
   database, more race tests, and the demo.
-- [ ] **5. Operability.** Producer authentication, signed webhooks, database timeouts, a readiness
-  check, body-size limits, structured logs and metrics, a replay endpoint, retention, container
-  deployment and a runbook.
+- [x] **5.1. Trust.** Producers with hashed, revocable API keys; deliveries and idempotency keys
+  scoped per producer; an event size limit; Standard Webhooks signatures with secret rotation;
+  signature checks in the test receiver; settings that never print secrets.
+- [ ] **5.2. Bounded waits.** Statement and lock timeouts, a short wait for a pooled connection, a
+  readiness check, and a worker that checks the schema at startup.
+- [ ] **5.3. Observability and operations.** Structured logs, metrics, a replay endpoint and a
+  retention job.
+- [ ] **5.4. Deployment.** Container images, migrations as a deploy step, a shutdown grace period,
+  backups and a runbook.
 
-Known limitations: one receiver, no authentication or signatures yet, idempotency keys and old
-rows are kept forever, no hard deadline for a whole attempt, and no ordering guarantee.
-Destinations chosen by producers, multiple tenants and a dashboard are not planned.
+Known limitations: one receiver with one set of secrets, no rate limits, API keys and idempotency
+keys that never expire, old rows kept forever, no hard deadline for a whole attempt, and no
+ordering guarantee. Destinations chosen by producers and a dashboard are not planned.

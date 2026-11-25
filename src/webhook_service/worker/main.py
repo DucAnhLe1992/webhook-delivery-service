@@ -6,6 +6,7 @@ Run it with `uv run webhook-worker`. Ctrl+C (or SIGTERM) stops it after the curr
 import logging
 import os
 import signal
+import sys
 import threading
 from datetime import timedelta
 
@@ -33,17 +34,25 @@ def process_one(engine: Engine, client: httpx2.Client, settings: Settings) -> bo
             claim_timeout=timedelta(seconds=settings.claim_timeout_seconds),
             max_attempts=settings.max_attempts,
         )
-    if delivery is None:
-        return False
+        if delivery is None:
+            return False
+        producer_name = delivery.producer.name
     attempt, claim_token = delivery.attempt_count, delivery.claim_token
     assert claim_token is not None
 
     # The claim is committed, so no transaction is held open while the receiver answers.
     message = WebhookMessage(
-        type=delivery.event_type, timestamp=delivery.created_at, data=delivery.payload
+        type=delivery.event_type,
+        producer=producer_name,
+        timestamp=delivery.created_at,
+        data=delivery.payload,
     )
     result = send_webhook(
-        client, str(settings.receiver_url), str(delivery.id), message.model_dump(mode="json")
+        client,
+        str(settings.receiver_url),
+        str(delivery.id),
+        message.model_dump(mode="json"),
+        signing_keys=settings.signing_keys,
     )
 
     retry_delay = backoff_delay(
@@ -108,6 +117,12 @@ def main() -> None:
     # HTTPX2 logs every request at INFO; the worker already logs one line per attempt.
     logging.getLogger("httpx2").setLevel(logging.WARNING)
     settings = get_settings()
+    if not settings.webhook_secrets:
+        sys.exit(
+            "WEBHOOK_SECRETS is not set, and the worker does not send unsigned webhooks. Create "
+            "a secret with `uv run webhook-admin new-webhook-secret`, set WEBHOOK_SECRETS to it, "
+            "and give the receiver the same secret."
+        )
     stop = threading.Event()
 
     def request_stop(signum: int, frame: object) -> None:
@@ -117,7 +132,12 @@ def main() -> None:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
-    log.info("started (pid %d), sending to %s", os.getpid(), settings.receiver_url)
+    log.info(
+        "started (pid %d), sending to %s, signing with %d secret(s)",
+        os.getpid(),
+        settings.receiver_url,
+        len(settings.webhook_secrets),
+    )
     with httpx2.Client(timeout=settings.delivery_timeout_seconds, follow_redirects=False) as client:
         run(get_engine(), client, settings, stop)
     log.info("stopped")
