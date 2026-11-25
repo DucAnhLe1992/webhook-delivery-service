@@ -11,6 +11,7 @@ from sqlalchemy import URL, Engine, create_engine, make_url, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from webhook_service.config import get_settings
 from webhook_service.db import get_session
 from webhook_service.main import app
 
@@ -23,6 +24,22 @@ TEST_DATABASE_URL = make_url(
 )
 
 
+def refuse_unless_disposable(url: URL) -> None:
+    """The tests delete all data in their database, so refuse any database not meant for that."""
+    if not (url.database or "").endswith("_test"):
+        pytest.fail(
+            f"TEST_DATABASE_URL names the database {url.database!r}. The tests delete all of "
+            "its data, so its name must end in _test.",
+            pytrace=False,
+        )
+    if url.database == make_url(str(get_settings().database_url)).database:
+        pytest.fail(
+            f"TEST_DATABASE_URL and DATABASE_URL both name {url.database!r}. The tests delete "
+            "all data in their database, so it must not be the one the service uses.",
+            pytrace=False,
+        )
+
+
 def create_database_if_missing(url: URL) -> None:
     server = create_engine(url.set(database="postgres"), isolation_level="AUTOCOMMIT")
     try:
@@ -31,7 +48,8 @@ def create_database_if_missing(url: URL) -> None:
                 text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": url.database}
             )
             if not exists:
-                connection.execute(text(f'CREATE DATABASE "{url.database}"'))
+                name = connection.dialect.identifier_preparer.quote_identifier(url.database)
+                connection.execute(text(f"CREATE DATABASE {name}"))
     finally:
         server.dispose()
 
@@ -39,6 +57,7 @@ def create_database_if_missing(url: URL) -> None:
 @pytest.fixture(scope="session")
 def engine() -> Iterator[Engine]:
     """The test database, migrated to the latest schema with the real Alembic migrations."""
+    refuse_unless_disposable(TEST_DATABASE_URL)
     try:
         create_database_if_missing(TEST_DATABASE_URL)
     except OperationalError:

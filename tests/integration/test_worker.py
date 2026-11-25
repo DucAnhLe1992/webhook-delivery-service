@@ -1,16 +1,19 @@
 import json
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import httpx2
+import pytest
 from sqlalchemy import Engine, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from webhook_service.config import Settings
-from webhook_service.sender import AttemptOutcome, AttemptResult, ErrorCategory
+from webhook_service.domain import AttemptOutcome, AttemptResult, ErrorCategory
 from webhook_service.services import delivery_service
-from webhook_service.worker.main import process_one
+from webhook_service.worker.main import process_one, run
 
 EVENT = {"event_type": "booking.confirmed", "data": {"booking_id": 42}}
 SETTINGS = Settings(
@@ -205,7 +208,7 @@ def test_an_expired_claim_without_attempts_left_fails_the_delivery(client, db):
     assert history(client, delivery_id) == [(1, "retryable_failure", "claim_expired")]
 
 
-def test_several_workers_send_each_delivery_exactly_once(client, db):
+def test_concurrent_workers_never_claim_the_same_delivery(client, db):
     delivery_ids = [submit(client) for _ in range(30)]
     sent_ids: list[str] = []
     lock = threading.Lock()
@@ -216,19 +219,141 @@ def test_several_workers_send_each_delivery_exactly_once(client, db):
         return httpx2.Response(200)
 
     def worker() -> None:
-        receiver = httpx2.Client(transport=httpx2.MockTransport(answer))
-        while process_one(db, receiver, SETTINGS):
-            pass
+        with httpx2.Client(transport=httpx2.MockTransport(answer)) as receiver:
+            while process_one(db, receiver, SETTINGS):
+                pass
 
-    workers = [threading.Thread(target=worker) for _ in range(4)]
-    for thread in workers:
-        thread.start()
-    for thread in workers:
-        thread.join(timeout=30)
+    pool = ThreadPoolExecutor(max_workers=4)
+    try:
+        workers = [pool.submit(worker) for _ in range(4)]
+        for finished in as_completed(workers, timeout=30):
+            finished.result()  # Re-raises an exception from the worker's thread.
+    finally:
+        pool.shutdown(wait=False)
 
+    # Every attempt succeeded, so a delivery sent twice could only mean two workers claimed it.
     assert sorted(sent_ids) == sorted(delivery_ids)
     with db.connect() as connection:
         delivered = connection.scalar(
             text("SELECT count(*) FROM deliveries WHERE status = 'delivered'")
         )
     assert delivered == 30
+
+
+class PausedBeforeCommit(Session):
+    """A session that stops just before it commits, keeping its locks, until released."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.paused = threading.Event()
+        self.release = threading.Event()
+
+    def commit(self) -> None:
+        self.flush()
+        self.paused.set()
+        assert self.release.wait(10)
+        super().commit()
+
+
+def test_a_late_result_waits_for_a_takeover_in_progress_and_is_then_discarded(
+    client, db, wait_until_blocked
+):
+    delivery_id = submit(client)
+    stalled = claim(db)  # Worker A claims the delivery, then stops responding...
+    make_due(db, delivery_id)  # ...until its claim expires.
+    takeover = PausedBeforeCommit(db, expire_on_commit=False)
+
+    def worker_b_takes_over() -> None:
+        with takeover:
+            delivery_service.claim_next_due(takeover, **CLAIM_OPTIONS)
+
+    def worker_a_saves_its_late_result() -> object:
+        with Session(db) as session:
+            return delivery_service.record_attempt(
+                session,
+                stalled.id,
+                stalled.claim_token,
+                AttemptResult(outcome=AttemptOutcome.DELIVERED, http_status=200, duration_ms=5),
+                retry_delay=timedelta(seconds=60),
+                max_attempts=3,
+            )
+
+    pool = ThreadPoolExecutor(max_workers=2)
+    try:
+        takeover_done = pool.submit(worker_b_takes_over)
+        # Worker B holds the row lock and has replaced the claim token, but not committed.
+        assert takeover.paused.wait(5)
+        late_save = pool.submit(worker_a_saves_its_late_result)
+        # Worker A's token check waits for B's lock instead of reading the old token.
+        wait_until_blocked()
+        takeover.release.set()
+        takeover_done.result(timeout=10)
+        saved = late_save.result(timeout=10)
+    finally:
+        takeover.release.set()
+        pool.shutdown(wait=False)
+
+    # Once B committed, A's check ran again on the new row, found B's token, and wrote nothing.
+    assert saved is None
+    assert client.get(f"/deliveries/{delivery_id}").json()["status"] == "processing"
+    assert history(client, delivery_id) == [
+        (1, "retryable_failure", "claim_expired"),
+        (2, None, None),
+    ]
+
+
+def test_a_result_lost_with_the_database_is_recovered_by_sending_again(client, db, monkeypatch):
+    delivery_id = submit(client)
+    receiver, sent = fake_receiver(200)
+
+    def database_gone(*args, **kwargs):
+        raise OperationalError("UPDATE deliveries ...", {}, Exception("connection lost"))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(delivery_service, "record_attempt", database_gone)
+        with pytest.raises(OperationalError):
+            process_one(db, receiver, SETTINGS)
+
+    # The receiver has the event, but the database does not know. Once the claim expires,
+    # another worker sends it again.
+    assert client.get(f"/deliveries/{delivery_id}").json()["status"] == "processing"
+    make_due(db, delivery_id)
+    assert process_one(db, receiver, SETTINGS) is True
+
+    assert history(client, delivery_id) == [
+        (1, "retryable_failure", "claim_expired"),
+        (2, "delivered", None),
+    ]
+    # Both copies carry the same webhook-id, so the receiver can recognize the second.
+    assert [request.headers["webhook-id"] for request in sent] == [delivery_id, delivery_id]
+
+
+def test_an_unexpected_error_does_not_stop_the_worker(client, db, caplog):
+    broken = submit(client)
+    healthy = submit(client)
+    attempted: list[str] = []
+    stop = threading.Event()
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        attempted.append(request.headers["webhook-id"])
+        if len(attempted) == 2:
+            stop.set()
+        if request.headers["webhook-id"] == broken:
+            raise RuntimeError("a bug while sending")
+        return httpx2.Response(200)
+
+    safety_net = threading.Timer(10, stop.set)
+    safety_net.start()
+    try:
+        with httpx2.Client(transport=httpx2.MockTransport(answer)) as receiver:
+            run(db, receiver, SETTINGS.model_copy(update={"poll_interval_seconds": 0.01}), stop)
+    finally:
+        safety_net.cancel()
+
+    assert sorted(attempted) == sorted([broken, healthy])
+    assert "unexpected error" in caplog.text
+    assert client.get(f"/deliveries/{healthy}").json()["status"] == "delivered"
+    # The broken delivery keeps its claim until it expires, then it is sent again.
+    broken_delivery = client.get(f"/deliveries/{broken}").json()
+    assert broken_delivery["status"] == "processing"
+    assert broken_delivery["attempt_count"] == 1

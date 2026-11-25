@@ -15,8 +15,11 @@ class Settings(BaseSettings):
     )
 
     # The only destination. Producers never choose where a webhook goes, which keeps
-    # the service from being used to make requests to arbitrary addresses (SSRF).
+    # the service from being used to make requests to arbitrary addresses (SSRF). Deliveries
+    # waiting for a retry go to the URL a worker has when it sends them, so every worker
+    # must use the same value.
     receiver_url: HttpUrl = HttpUrl("http://127.0.0.1:9000/webhooks")
+    # How long each network step of an attempt may take; see claim_outlasts_an_attempt.
     delivery_timeout_seconds: PositiveFloat = 5.0
 
     # Worker: a delivery gets at most max_attempts attempts. After a retryable failure it
@@ -31,12 +34,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def claim_outlasts_an_attempt(self) -> Self:
-        # The timeout applies separately to connecting, sending and reading, so one slow
-        # attempt can take several times DELIVERY_TIMEOUT_SECONDS.
+        # The timeout applies to each network step separately: connecting, sending the request
+        # and waiting for the receiver's status line. A receiver that is slow at every step
+        # takes about 3 x the timeout, so a claim must last at least that long. It is not a
+        # hard limit: a receiver that sends its status line a few bytes at a time can outlast
+        # any claim. Another worker then sends the delivery again, with the same webhook-id,
+        # and the late result is discarded.
         if self.claim_timeout_seconds < 3 * self.delivery_timeout_seconds:
             raise ValueError(
-                "CLAIM_TIMEOUT_SECONDS must be at least 3 x DELIVERY_TIMEOUT_SECONDS, "
-                "or slow attempts would lose their claim"
+                "CLAIM_TIMEOUT_SECONDS must be at least 3 x DELIVERY_TIMEOUT_SECONDS, so that "
+                "an attempt that is slow at every step keeps its claim"
             )
         return self
 

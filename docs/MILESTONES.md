@@ -1,8 +1,9 @@
 # How it was built
 
-The service was built in four milestones. Each one added a single guarantee, then ended with
-three experiments that broke the system on purpose. Each experiment's result explains why the
-next milestone was needed. This document records the steps, the questions and the answers.
+The service was built in four milestones, then tightened in a fifth pass, 4.1, after an external
+review. Each milestone added a single guarantee, then ended with three experiments that broke the
+system on purpose. Each experiment's result explains why the next milestone was needed. This
+document records the steps, the questions and the answers.
 
 For how the finished service works, see the [user manual](USER_MANUAL.md) and
 [ARCHITECTURE.md](../ARCHITECTURE.md).
@@ -12,7 +13,8 @@ For how the finished service works, see the [user manual](USER_MANUAL.md) and
 | [1. Send it now](#milestone-1-send-it-now) | `milestone-1` | An endpoint that sends each webhook during the request | None yet: an event arrives only if the receiver is up at that moment | Events are lost, and a timeout means "unknown" |
 | [2. Store before acknowledging](#milestone-2-store-before-acknowledging) | `milestone-2` | PostgreSQL, `202` after commit, `503` when storage is down | An accepted event is never lost | Nothing sends the stored events |
 | [3. A separate worker](#milestone-3-a-separate-worker) | `milestone-3` | A worker process that claims, sends, records and retries | Stored events are sent and retried, even while the API is down | A crashed worker strands its delivery, retries never stop, and duplicates are possible |
-| [4. Reliability](#milestone-4-reliability) | `milestone-4` | Expiring claims, claim tokens, attempt history, backoff and limits, `Idempotency-Key`, `SKIP LOCKED` | At-least-once delivery through crashes, bounded retries, safe producer retries, many workers | Nothing new; the remaining work is operations (milestone 5) |
+| [4. Reliability](#milestone-4-reliability) | `milestone-4` | Expiring claims, claim tokens, attempt history, backoff and limits, `Idempotency-Key`, `SKIP LOCKED` | At-least-once delivery through crashes, bounded retries, safe producer retries, many workers | Nothing new. An external review then found guarantees stated more strongly than the code kept them |
+| [4.1. Tighter guarantees](#milestone-41-tighter-guarantees) | `milestone-4.1` | A sender that reads only the status code, a worker loop no error can stop, honest `503` answers, a hard retry cap, a guarded test database, 14 more tests, the demo | Every guarantee worded exactly as the code keeps it, and no receiver answer can stop a worker | The remaining work is operations (milestone 5) |
 
 ## Milestone 1: send it now
 
@@ -219,6 +221,115 @@ when several workers run at once.
 **Lesson.** Any process can die between any two steps. So every step must be safe to repeat, and
 every write must prove that its writer still owns the work.
 
+## Milestone 4.1: tighter guarantees
+
+**Goal.** Make every guarantee exactly as strong as the code, no stronger, and test the edges where
+an outcome becomes uncertain. No new features.
+
+**Why.** After milestone 4, an external review (by Perplexity) read the code against the
+documentation. Each finding below was checked against the code, and the behavioral ones were
+reproduced with a local test server. The two marked "found while checking" were not in the review.
+
+| Finding | Evidence |
+|---|---|
+| A `503` said "the delivery was not accepted", but the connection can fail after PostgreSQL has committed. | Now a test: a session that commits, then raises a connection error. |
+| `DELIVERY_TIMEOUT_SECONDS` limits each network step, not the attempt, so "3 × the timeout" does not bound an attempt. | A body sent at 1 byte per second kept an attempt with a 2-second timeout busy for 7 seconds. |
+| The worker read every response body in full. | A 256 MB body added 513 MB to the worker's memory. |
+| A body that does not decode stopped the worker (found while checking). | A `200` with a corrupt gzip body raised `DecodingError` out of the worker loop. |
+| A full connection pool answered `500`, not `503` (found while checking). | SQLAlchemy's pool `TimeoutError` is not an `OperationalError`. |
+| The retry "maximum" could be exceeded by 20%. | A capped wait with maximum jitter came to 4,320 seconds against a 3,600-second maximum. |
+| The tests would empty any database `TEST_DATABASE_URL` named. | The fixture checked nothing before `TRUNCATE`. |
+| Some sentences in the docs claimed more than the code does. | Claim expiry versus takeover, what an attempt row proves, and which invariants the database enforces. |
+
+**What changed.**
+
+- The sender streams the response, decides by the status code, and closes the connection without
+  reading the body. Every request error, not only transport errors, becomes a retryable result.
+- The worker loop logs an unexpected error with its traceback and carries on. The delivery it held
+  is sent again once its claim expires, and the attempt still counts.
+- A `503` for a submission now says the outcome is unknown and to retry with the same
+  `Idempotency-Key`. Reads get their own message, and a full connection pool gives `503` too.
+- Waits are capped again after the jitter, so `RETRY_MAX_DELAY_SECONDS` is a hard limit.
+- The test fixtures refuse a database whose name does not end in `_test`, or the one
+  `DATABASE_URL` names, and quote the name when they create a database.
+- Delivery states and attempt outcomes moved to `domain.py`, so the database models no longer
+  import the HTTP sender.
+- 14 more tests, 53 in all:
+  - the sender against a real HTTP server (a slow body, a huge body, a corrupt body, a dropped
+    connection, no answer);
+  - a commit whose answer is lost, and a full connection pool;
+  - a late result racing a takeover that holds the row lock;
+  - the same key with different content at the same moment, and after the first request rolls
+    back;
+  - a database failure while a result is saved, and an unexpected error in the worker loop.
+
+  The multi-worker test now runs its threads as futures, so an error or a hang in any thread
+  fails it.
+- `dev/demo.py` plays four scenes with real processes, including a worker killed with `SIGKILL`.
+- The docs state each guarantee exactly.
+
+**Decided against.**
+
+- **Saving the receiver URL on each delivery.** A planned move of the receiver would strand
+  waiting deliveries at the old address. Waiting deliveries follow the current `RECEIVER_URL`, and
+  every worker needs the same value. With several receivers, a delivery would point to a
+  destination by ID, whose URL could change.
+- **Renaming "at least once".** The term stays, qualified: within the retry window.
+- **Changing the timestamps from `now()`.** It is the transaction's start time, which differs from
+  the wall clock only by the length of these transactions: milliseconds.
+- **Killing a real worker in CI.** It depends on timing, so it lives in the demo.
+- **A constraint for every invariant.** Some, such as ordering of timestamps, would turn a clock
+  adjustment into a failure. The docs now list exactly which invariants the database enforces.
+- **A deadline for a whole attempt, for now.** It needs `async` cancellation or a custom transport.
+  Streaming removed the slow-body case. A receiver that sends its status line a few bytes at a time
+  can still outlast a claim, which costs a duplicate, never a corrupted state.
+
+**Experiments.**
+
+1. **Run the demo.** Run `uv run python dev/demo.py`. Scenes 3 and 4 both end with the receiver
+   processing the same event twice. *The two duplicates have different causes. What are they, and
+   why can the service prevent neither?*
+
+   In scene 3, the receiver processed the event but answered after the worker had stopped
+   waiting. In scene 4, the worker died after sending and before saving a result. In both cases,
+   the service is left without an answer. "Processed but unconfirmed" and "never arrived" look
+   identical from its side, and only the receiver knows which happened. Sending again is the only
+   choice that never loses an event. So the service makes the duplicate recognizable, with the
+   same `webhook-id`, and the receiver drops it.
+
+2. **Break the record step.** Remove `.with_for_update()` from the `SELECT` in `record_attempt`
+   and run `uv run pytest -k "late_result or taken_over"`. The new test fails, while the older
+   takeover test still passes. *The token is checked in the `WHERE` clause anyway. Why does the
+   check need a row lock?*
+
+   Without the lock, the late worker's `SELECT` reads the last committed version of the row. The
+   takeover has not committed yet, so that version still has the late worker's token, and the
+   check passes. The late worker's updates then wait behind the takeover's locks and apply after
+   it commits. They overwrite attempt 1's `claim_expired` and mark the delivery `delivered`, while
+   worker B is still sending attempt 2. With `FOR UPDATE`, the `SELECT` waits for the takeover, and
+   PostgreSQL evaluates the `WHERE` clause again on the new version of the row. The new token does
+   not match, so nothing is returned. The check and the write become one step that a takeover
+   cannot slip between. The older test lets the takeover finish first, so the old token is gone
+   either way; only real contention shows the difference.
+
+3. **Lose a commit.** Read
+   `test_a_submission_whose_commit_was_not_confirmed_can_be_retried_with_its_key`. PostgreSQL
+   commits, then the connection fails, and the API answers `503`. *Why can't the API answer
+   correctly, and why does an `Idempotency-Key` make it harmless?*
+
+   The answer to `COMMIT` travels over the same connection that failed. "The commit never arrived"
+   and "the commit happened, but its answer was lost" look the same to the API: the same
+   uncertainty as a receiver's timeout, one boundary further in. Finding out would mean asking a
+   database that is not answering. So the API says the outcome is unknown and tells the producer
+   how to settle it. A retry with the same key either stores the delivery or runs into the stored
+   one and replays it, so exactly one delivery exists either way. Without a key, the retry could
+   store a second one.
+
+**Lesson.** A guarantee is only as strong as its weakest sentence. Every boundary where an answer
+can be lost, whether at the receiver, the database or a worker, has the same shape: "not done" and
+"done but unconfirmed" look alike. The answer is always a stable identifier that makes the retry
+safe, and a test that puts the system exactly on that boundary.
+
 ## Three hops, three identifiers
 
 An event crosses three hops, and each one can repeat. Each hop has its own identifier that makes
@@ -233,13 +344,25 @@ a repeat harmless:
 Every hop delivers at least once, and every repeat is recognized and dropped. Together, as long as
 the receiver drops duplicates, each event takes effect once, with no distributed transaction.
 
+Milestone 4.1 found one more place where an answer can be lost: the API's own commit. It needs no
+new identifier. The producer's retry passes through the same first hop, so its `Idempotency-Key`
+already makes the retry safe.
+
 ## Milestone 5: operability (planned)
 
 - Producer authentication, with idempotency keys scoped per producer.
 - Signed webhooks (`webhook-signature`, as in Standard Webhooks).
+- A time budget for every database operation: statement and lock timeouts, and a shorter wait for
+  a pooled connection than SQLAlchemy's default 30 seconds.
+- A readiness endpoint that checks the database, next to `/health`.
+- A limit on the size of submitted events.
 - Structured logs and metrics: the age of the oldest due delivery, the retry rate, and failures.
 - An endpoint to replay failed deliveries.
-- Container images, deployment instructions and a runbook.
+- A retention job. It must keep deliveries longer than producers may retry, because deleting a
+  delivery frees its idempotency key.
+- A container image with API and worker entry points, migration steps, a shutdown grace period
+  longer than an attempt, backups, and a runbook.
+- Static type checking in CI.
 
 After that, CarRental can publish its booking events through a transactional outbox, as described
 in the [user manual](USER_MANUAL.md#recommended-integration-the-transactional-outbox).

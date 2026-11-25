@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from webhook_service.db import get_session
-from webhook_service.models import DeliveryStatus
+from webhook_service.domain import DeliveryStatus
 from webhook_service.schemas import DeliveryAccepted, DeliveryDetail, DeliveryRequest
 from webhook_service.services import delivery_service
 
@@ -22,7 +22,11 @@ SessionDep = Annotated[Session, Depends(get_session)]
     responses={
         status.HTTP_409_CONFLICT: {
             "description": "The Idempotency-Key was already used for a different request"
-        }
+        },
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "description": "Storage is unavailable, so it is not known whether the delivery "
+            "was stored. Retry with the same Idempotency-Key."
+        },
     },
 )
 def submit_delivery(
@@ -53,7 +57,10 @@ def submit_delivery(
 
 @router.get(
     "/{delivery_id}",
-    responses={status.HTTP_404_NOT_FOUND: {"description": "No delivery with this ID"}},
+    responses={
+        status.HTTP_404_NOT_FOUND: {"description": "No delivery with this ID"},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Storage is unavailable"},
+    },
 )
 def read_delivery(delivery_id: uuid.UUID, session: SessionDep) -> DeliveryDetail:
     delivery = delivery_service.get_delivery(session, delivery_id)

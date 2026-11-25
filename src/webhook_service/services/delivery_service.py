@@ -8,8 +8,8 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, selectinload
 
-from webhook_service.models import Delivery, DeliveryAttempt, DeliveryStatus
-from webhook_service.sender import AttemptOutcome, AttemptResult, ErrorCategory
+from webhook_service.domain import AttemptOutcome, AttemptResult, DeliveryStatus, ErrorCategory
+from webhook_service.models import Delivery, DeliveryAttempt
 
 
 class IdempotencyKeyReused(Exception):

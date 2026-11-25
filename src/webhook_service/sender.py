@@ -2,34 +2,11 @@
 
 import json
 import time
-from enum import StrEnum
 from typing import Any
 
 import httpx2
-from pydantic import BaseModel
 
-
-class AttemptOutcome(StrEnum):
-    DELIVERED = "delivered"
-    RETRYABLE_FAILURE = "retryable_failure"
-    PERMANENT_FAILURE = "permanent_failure"
-
-
-class ErrorCategory(StrEnum):
-    TIMEOUT = "timeout"
-    CONNECTION_ERROR = "connection_error"
-    HTTP_ERROR = "http_error"
-    # Recorded by the worker that takes over an expired claim, not by the sender: the
-    # previous worker stopped before saving a result, so the receiver may have the event.
-    CLAIM_EXPIRED = "claim_expired"
-
-
-class AttemptResult(BaseModel):
-    outcome: AttemptOutcome
-    http_status: int | None = None
-    error_category: ErrorCategory | None = None
-    duration_ms: int
-
+from webhook_service.domain import AttemptOutcome, AttemptResult, ErrorCategory
 
 RETRYABLE_STATUS_CODES = {408, 429}
 
@@ -47,6 +24,11 @@ def classify_status(status_code: int) -> AttemptOutcome:
 def send_webhook(
     client: httpx2.Client, url: str, webhook_id: str, payload: dict[str, Any]
 ) -> AttemptResult:
+    """Send one attempt and classify it by the receiver's status code alone.
+
+    The response body is never read. The status line is the whole answer, and the receiver
+    must not be able to make the worker download a large or slow body, or fail to decode one.
+    """
     body = json.dumps(payload, separators=(",", ":")).encode()
     headers = {
         "content-type": "application/json",
@@ -60,7 +42,9 @@ def send_webhook(
         return round((time.perf_counter() - started) * 1000)
 
     try:
-        response = client.post(url, content=body, headers=headers)
+        # Leaving the block closes the response without reading its body.
+        with client.stream("POST", url, content=body, headers=headers) as response:
+            status_code = response.status_code
     except httpx2.TimeoutException:
         # The receiver may already have processed the event; only its answer is missing.
         return AttemptResult(
@@ -68,17 +52,20 @@ def send_webhook(
             error_category=ErrorCategory.TIMEOUT,
             duration_ms=elapsed_ms(),
         )
-    except httpx2.TransportError:
+    except httpx2.RequestError:
+        # A refused, reset or dropped connection, or anything else that stopped the request
+        # from completing. Every such error is classified here, so no answer from the
+        # receiver can crash the worker.
         return AttemptResult(
             outcome=AttemptOutcome.RETRYABLE_FAILURE,
             error_category=ErrorCategory.CONNECTION_ERROR,
             duration_ms=elapsed_ms(),
         )
 
-    outcome = classify_status(response.status_code)
+    outcome = classify_status(status_code)
     return AttemptResult(
         outcome=outcome,
-        http_status=response.status_code,
+        http_status=status_code,
         error_category=None if outcome is AttemptOutcome.DELIVERED else ErrorCategory.HTTP_ERROR,
         duration_ms=elapsed_ms(),
     )

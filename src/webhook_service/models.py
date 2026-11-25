@@ -17,7 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from webhook_service.sender import AttemptOutcome
+from webhook_service.domain import AttemptOutcome, DeliveryStatus
 
 
 class Base(DeclarativeBase):
@@ -31,15 +31,6 @@ class Base(DeclarativeBase):
             "pk": "pk_%(table_name)s",
         }
     )
-
-
-class DeliveryStatus(StrEnum):
-    """pending -> processing -> delivered, back to pending to retry, or failed."""
-
-    PENDING = "pending"
-    PROCESSING = "processing"
-    DELIVERED = "delivered"
-    FAILED = "failed"
 
 
 def one_of(column: str, values: type[StrEnum]) -> str:

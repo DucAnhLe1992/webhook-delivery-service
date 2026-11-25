@@ -16,10 +16,10 @@ from sqlalchemy.orm import Session
 
 from webhook_service.config import Settings, get_settings
 from webhook_service.db import get_engine
-from webhook_service.models import DeliveryStatus
+from webhook_service.domain import AttemptOutcome, AttemptResult, DeliveryStatus
 from webhook_service.retry import backoff_delay
 from webhook_service.schemas import WebhookMessage
-from webhook_service.sender import AttemptOutcome, AttemptResult, send_webhook
+from webhook_service.sender import send_webhook
 from webhook_service.services import delivery_service
 
 log = logging.getLogger("worker")
@@ -63,8 +63,8 @@ def process_one(engine: Engine, client: httpx2.Client, settings: Settings) -> bo
 
     if status is None:
         log.warning(
-            "%s attempt %d: the claim expired before the result was saved; "
-            "another worker has taken over",
+            "%s attempt %d: result discarded; the claim expired and another worker "
+            "took the delivery over",
             delivery.id,
             attempt,
         )
@@ -90,6 +90,11 @@ def run(engine: Engine, client: httpx2.Client, settings: Settings, stop: threadi
             worked = process_one(engine, client, settings)
         except OperationalError:
             log.warning("database unavailable, trying again in %ss", settings.poll_interval_seconds)
+            worked = False
+        except Exception:
+            # A bug must not stop every delivery. A delivery claimed before the error is sent
+            # again once its claim expires, and the attempt still counts towards the limit.
+            log.exception("unexpected error, trying again in %ss", settings.poll_interval_seconds)
             worked = False
         if not worked:
             # Sleep until the next poll, but wake up at once when asked to stop.

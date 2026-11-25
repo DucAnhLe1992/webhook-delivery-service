@@ -4,8 +4,8 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from webhook_service.models import Delivery, DeliveryStatus
-from webhook_service.sender import AttemptOutcome, ErrorCategory
+from webhook_service.domain import AttemptOutcome, DeliveryStatus, ErrorCategory
+from webhook_service.models import Delivery
 
 
 class DeliveryRequest(BaseModel):

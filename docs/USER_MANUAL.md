@@ -38,7 +38,7 @@ webhook), keeps trying when the receiver is down, and records every attempt.
 | **Producer** | An application that submits events, for example CarRental. |
 | **Receiver** | The HTTP endpoint that gets the webhooks. There is one, set by `RECEIVER_URL`. |
 | **Delivery** | One accepted event and its delivery state. Its ID is sent to the receiver as `webhook-id`. |
-| **Attempt** | One try at sending a delivery. A delivery can have several. |
+| **Attempt** | One try at sending a delivery. It is recorded when a worker claims the delivery, so an attempt cut short by a crash may never have reached the receiver. A delivery can have several. |
 | **API** | The process that accepts and reports deliveries (`uvicorn webhook_service.main:app`). |
 | **Worker** | A process that sends deliveries (`webhook-worker`). You can run several. |
 | **Claim** | A worker's temporary ownership of a delivery while it sends it. Claims expire. |
@@ -56,6 +56,9 @@ What the service promises, in plain words:
 
 - **When the API answers `202`, the event is saved.** It survives restarts of the API, the workers
   and the database server.
+- **When the API answers `503`, or no answer arrives, the event may or may not be saved.** The
+  connection can fail just after the database saved it. Retrying with the same `Idempotency-Key`
+  is safe either way.
 - **Every saved event is sent until it is delivered or clearly fails.** Failures are retried with
   growing waits, up to `MAX_ATTEMPTS` attempts.
 - **An event may arrive more than once.** When the service cannot tell whether the receiver got it
@@ -115,9 +118,27 @@ Times are in the machine's local time. Other worker messages:
 | `failed permanently (HTTP 400)` | The receiver rejected it; it will not be retried. |
 | `failed (timeout), retrying in 9s` | No answer in time; the receiver may still have processed it. |
 | `failed (connection_error), retrying in 10s` | The receiver could not be reached. |
-| `the claim expired before the result was saved; another worker has taken over` | This worker was too slow, so its result was discarded. |
+| `result discarded; the claim expired and another worker took the delivery over` | This worker was so slow that its claim expired and another worker took over, so its result was not saved. |
 | `database unavailable, trying again in 1.0s` | PostgreSQL is down; the worker keeps polling. |
+| `unexpected error, trying again in 1.0s`, with a traceback | A bug. The worker carries on with other deliveries; the one it held is sent again when its claim expires. |
 | `stopping after the current delivery`, then `stopped` | A clean stop after Ctrl+C or `SIGTERM`. |
+
+### Watching it work: the demo
+
+`uv run python dev/demo.py` shows the guarantees with real processes. It needs PostgreSQL running,
+creates its own `webhooks_demo` database, starts a test receiver, the API and a worker on free
+ports with short timeouts, and plays four scenes in about 20 seconds:
+
+| Scene | What happens | What it shows |
+|---|---|---|
+| 1 | The same request is sent twice with one `Idempotency-Key`, then with different content. | `202`, a replay with `Idempotent-Replayed: true`, then `409`. One delivery. |
+| 2 | The receiver is stopped. | `connection_error` attempts with growing waits, then delivery once the receiver is back. |
+| 3 | The receiver answers after 3 seconds; the worker waits 2. | A `timeout`, a retry, and the receiver processing the same `webhook-id` twice. |
+| 4 | The worker is killed with `SIGKILL` while it waits for the receiver. | The delivery stuck in `processing` until its claim expires, then `claim_expired` and delivery by a new worker. |
+
+It prints each step, the worker's and the receiver's log lines, and each delivery's attempt
+history. The demo database is emptied at the start of every run and left in place afterwards, so
+you can look at it with `psql`.
 
 ### Running more workers
 
@@ -220,22 +241,27 @@ what is wrong and where:
 Other examples are `extra_forbidden` with `loc: ["body", "url"]` for an unknown field, and
 `string_too_long` with `loc: ["header", "idempotency-key"]` for a key longer than 255 characters.
 
-**`503 Service Unavailable`**: the database could not be reached, so the delivery was not
-accepted.
+**`503 Service Unavailable`**: the database could not be reached, or was too busy to hand out a
+connection in time.
 
 ```http
 HTTP/1.1 503 Service Unavailable
 retry-after: 5
 
-{"detail": "Storage is unavailable; the delivery was not accepted. Retry later."}
+{"detail": "Storage is unavailable, so it is not known whether the delivery was stored. Retry with the same Idempotency-Key."}
 ```
+
+Usually nothing was stored. But if the connection failed while the API was committing, the
+database may have saved the delivery without the API hearing back, so the API cannot promise
+either way. A retry with the same key stores the delivery, or finds the stored one and returns it
+as a replay.
 
 ### What a producer should do
 
 | The producer sees | Meaning | Do this |
 |---|---|---|
 | `202` | Stored, now or by an earlier identical request. | Done. Mark the event as handed over. |
-| `503` | Not accepted. | Wait at least `Retry-After` seconds, then retry with the same key. |
+| `503` | Not confirmed: usually not stored, but possibly stored just before the connection failed. | Wait at least `Retry-After` seconds, then retry with the same key. |
 | A timeout, a dropped connection or another 5xx | Unknown: it may or may not be stored. | Retry with the same key, waiting longer each time. |
 | `409` | The key was reused for different content. | Do not retry. This is a bug in how the producer builds keys. |
 | `422` | The request is invalid. | Do not retry. Fix the request. |
@@ -247,11 +273,11 @@ from "never arrived", and must send again. The key makes that resend harmless.
 
 | Situation | Result |
 |---|---|
-| No key | A new delivery every time. A resend creates a duplicate the receiver cannot detect, because it gets a new `webhook-id`. |
+| No key | A new delivery every time. A resend creates a duplicate the receiver cannot detect, because it gets a new `webhook-id`. That includes a resend after a `503` or a lost answer, if the first request was in fact stored. |
 | A new key | A new delivery, stored with the key. |
 | A known key, same content | `202` with the original delivery and `Idempotent-Replayed: true`. |
 | A known key, different content | `409 Conflict`. |
-| The same new key sent twice at the same moment | One delivery. The second request waits for the first, then gets the replay. |
+| The same new key sent twice at the same moment | One delivery. The second request waits for the first, then gets the replay, or `409` if the content differs. If the first request fails before it commits, the second stores its own delivery. |
 
 "Same content" means the same `event_type` and `data`. The order of keys inside `data` does not
 matter.
@@ -349,7 +375,7 @@ last claim, left over and no longer meaningful.
 | `delivery_id` | Also sent to the receiver as `webhook-id`. |
 | `event_type`, `data` | What the producer submitted. |
 | `status` | `pending`, `processing`, `delivered` or `failed`. |
-| `attempt_count` | Attempts started so far, including one in progress. |
+| `attempt_count` | Attempts started so far, including one in progress or one cut short by a crash. |
 | `last_http_status`, `last_error_category` | Result of the latest attempt whose worker saved a result. An attempt closed as `claim_expired` does not change them. |
 | `next_attempt_at` | While `pending`: when the next attempt is due. While `processing`: when the current claim expires. Ignore it for `delivered` and `failed`. |
 | `created_at` | When it was accepted. Also the body's `timestamp` in the webhook. |
@@ -365,9 +391,11 @@ Each attempt has:
 | `outcome` | `delivered`, `retryable_failure`, `permanent_failure`, or `null` while in progress. |
 | `http_status` | The receiver's status, or `null` if it never answered. |
 | `error_category` | `timeout`, `connection_error`, `http_error`, `claim_expired`, or `null`. |
-| `duration_ms` | Time spent on the HTTP request. |
+| `duration_ms` | Time until the receiver's status code arrived, or until the request failed. |
 
 An unknown ID returns `404` with `{"detail": "Delivery not found"}`. A malformed ID returns `422`.
+If the database is unavailable, it returns `503` with
+`{"detail": "Storage is unavailable. Retry later."}`.
 
 ### Reading the history
 
@@ -444,6 +472,9 @@ webhook-timestamp: 1795476541
 | Any other 4xx | Marks it `failed`, with no retry. |
 | 3xx | Marks it `failed`. Redirects are never followed. |
 
+Only the status code counts. The service closes the connection as soon as your status line
+arrives, without reading the body, so the body can be empty; anything in it is ignored.
+
 So a receiver should:
 
 1. **Answer quickly.** Save the event, answer `200`, and do slow work afterwards. A slow answer
@@ -472,11 +503,13 @@ ON CONFLICT (webhook_id) DO NOTHING;
 -- 0 rows inserted: duplicate. Skip the work, commit, answer 200.
 ```
 
-Because the ID and the work commit together, a crash can never leave one without the other. Keep
-IDs at least as long as the retry window, about 21 minutes with the default settings, and longer
-if operators may [replay](#replaying-a-failed-delivery) old deliveries. Keeping them for a few
-days is a safe choice. CarRental already does the same for Stripe events, with its
-`stripe_events` table.
+Because the ID and the work commit together, a crash can never leave one without the other. Two
+copies can even arrive at the same moment, when a frozen worker's request and its replacement
+overlap. The same pattern handles that: the second insert waits for the first transaction, then
+inserts nothing. Keep IDs at least as long as the retry window, about 21 minutes with the default
+settings, and longer if operators may [replay](#replaying-a-failed-delivery) old deliveries.
+Keeping them for a few days is a safe choice. CarRental already does the same for Stripe events,
+with its `stripe_events` table.
 
 ### Security
 
@@ -542,11 +575,12 @@ Each worker repeats this loop:
    - marks the delivery `processing` and adds 1 to `attempt_count`;
    - opens an attempt row and stores its ID as the delivery's claim token;
    - moves `next_attempt_at` to now plus `CLAIM_TIMEOUT_SECONDS`, the moment the claim expires.
-2. **Send.** It posts the webhook with no transaction open. Nothing in the database is locked
-   while the receiver thinks.
+2. **Send.** It posts the webhook with no transaction open, and reads only the status code.
+   Nothing in the database is locked while the receiver thinks.
 3. **Record.** In a new short transaction, it locks the delivery again, but only if the claim
-   token is still its own. If the token changed, another worker took over, and this worker
-   discards its result. Otherwise it finishes the attempt row, clears the claim token, and sets:
+   token is still its own. An expired claim still counts as its own until another worker takes
+   the delivery over. If the token changed, another worker took over, and this worker discards
+   its result. Otherwise it finishes the attempt row, clears the claim token, and sets:
    - `delivered` for a 2xx;
    - `pending`, with `next_attempt_at` moved ahead by the retry delay, for a retryable failure
      with attempts left;
@@ -555,8 +589,8 @@ Each worker repeats this loop:
 
 ### 6.3 Retries
 
-After a retryable failure, the wait doubles from `RETRY_BASE_DELAY_SECONDS` up to
-`RETRY_MAX_DELAY_SECONDS`, and varies by up to 20% either way. With the defaults:
+After a retryable failure, the wait doubles from `RETRY_BASE_DELAY_SECONDS` and varies by up to
+20% either way, but never exceeds `RETRY_MAX_DELAY_SECONDS`. With the defaults:
 
 | Attempt | Starts about this long after the first | Wait if it fails |
 |---|---|---|
@@ -581,9 +615,11 @@ due deliveries once per interval. That is why the example in
 3. Worker B claims it. It closes attempt 1 as `retryable_failure` with `claim_expired`, opens
    attempt 2 with a new claim token, and sends it again with the same `webhook-id`.
 4. If worker A wakes up and tries to save its result, its claim token no longer matches, so nothing
-   changes.
+   changes. Had it woken up before worker B took over, its result would have been saved: expiry
+   only makes the delivery available, and the takeover is what revokes A's claim.
 
-The receiver may get the event twice, because worker A might have reached it. That is why
+The receiver may get the event twice, because worker A might have reached it. The claim token
+protects the database, not the receiver: it cannot recall a request A already sent. That is why
 receivers skip duplicates. If attempts have run out when the claim expires, the delivery becomes
 `failed` instead of being claimed again.
 
@@ -595,8 +631,8 @@ before exiting.
 Every worker runs the same claim query. `SKIP LOCKED` makes each one pass over rows that another
 worker is claiming at that moment, so they share the queue without waiting for each other and
 never claim the same delivery. In a live run, two workers split 20 events 9 and 11. The test
-`test_several_workers_send_each_delivery_exactly_once` runs four workers on 30 deliveries and
-checks that each one is sent exactly once.
+`test_concurrent_workers_never_claim_the_same_delivery` runs four workers on 30 deliveries and
+checks that none was claimed twice.
 
 ### 6.6 One event from start to finish
 
@@ -624,14 +660,14 @@ Environment variables win. Copy `.env.example` to start.
 | Variable | Default | Used by | Meaning |
 |---|---|---|---|
 | `DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks` | API, worker, migrations | PostgreSQL connection. |
-| `RECEIVER_URL` | `http://127.0.0.1:9000/webhooks` | Worker | The only destination. |
-| `DELIVERY_TIMEOUT_SECONDS` | `5` | Worker | How long each phase of a request (connecting, sending, reading) may take. |
+| `RECEIVER_URL` | `http://127.0.0.1:9000/webhooks` | Worker | The only destination. Deliveries waiting for a retry go to the value a worker has when it sends them, so changing it moves them to the new receiver. Give every worker the same value. |
+| `DELIVERY_TIMEOUT_SECONDS` | `5` | Worker | How long each network step of an attempt may take: connecting, sending, and waiting for the status code. It does not limit the attempt as a whole. |
 | `MAX_ATTEMPTS` | `8` | Worker | Attempts per delivery before it is marked `failed`. |
 | `RETRY_BASE_DELAY_SECONDS` | `10` | Worker | Wait after the first failed attempt; it doubles after each one. |
-| `RETRY_MAX_DELAY_SECONDS` | `3600` | Worker | Longest wait between attempts. |
+| `RETRY_MAX_DELAY_SECONDS` | `3600` | Worker | Longest wait between attempts, jitter included. |
 | `CLAIM_TIMEOUT_SECONDS` | `60` | Worker | How long a claim lasts. Must be at least 3 × `DELIVERY_TIMEOUT_SECONDS`, or the worker refuses to start. |
 | `POLL_INTERVAL_SECONDS` | `1` | Worker | How often an idle worker looks for due deliveries. |
-| `TEST_DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks_test` | Tests | Database for integration tests. It is created and migrated automatically. |
+| `TEST_DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks_test` | Tests | Database for integration tests. It is created and migrated automatically. The tests delete all its data, so its name must end in `_test`, and it must not be the database `DATABASE_URL` names. |
 
 Some guidance:
 
@@ -639,7 +675,9 @@ Some guidance:
   about *b* × (2^(n−1) − 1) seconds after the first. That is 1,270 s, about 21 minutes, with the
   defaults. Receivers must remember `webhook-id`s at least that long.
 - **Claim timeout:** too short, and slow but healthy workers lose their claims, causing extra
-  duplicates. Too long, and deliveries from crashed workers wait longer to be recovered.
+  duplicates. Too long, and deliveries from crashed workers wait longer to be recovered. The
+  3 × rule covers a receiver that is slow at every step; a receiver that sends its status line a
+  few bytes at a time can still outlast any claim, which causes a duplicate.
 - **Delivery timeout:** raise it only if the receiver is legitimately slow, and raise
   `CLAIM_TIMEOUT_SECONDS` with it.
 
@@ -691,13 +729,15 @@ so in rare cases it is another source of duplicates.
 
 | Symptom | Likely cause | What to do |
 |---|---|---|
-| `POST` returns `503` | PostgreSQL is unreachable. | Run `docker compose ps` and start the database. Producers retry by themselves. |
+| `POST` returns `503` | PostgreSQL is unreachable. | Run `docker compose ps` and start the database. Producers retry by themselves, with the same key. |
+| `POST` returns `503` after about 30 seconds while the database is up | Every pooled database connection is busy. | The API or the database is overloaded. Producers retry; add capacity if it persists. |
 | Deliveries stay `pending`, and `oldest_due_waiting` grows | No worker is running, or workers cannot reach the database. | Start workers and read their logs. |
 | Many `connection_error` attempts | The receiver is down, or `RECEIVER_URL` is wrong. | Fix the receiver. Deliveries retry by themselves until `MAX_ATTEMPTS`. |
 | Many `timeout` attempts | The receiver is slow. | Make it answer before doing slow work. Raise the timeouts only if that is not possible. |
 | `permanent_failure` with a 4xx | The receiver rejects the event. | Fix the receiver or the producer, then replay. |
 | A delivery is `processing` for a long time | A worker is sending it, or crashed while doing so. | Wait `CLAIM_TIMEOUT_SECONDS`; another worker takes over by itself. |
 | `claim_expired` in a history | A worker crashed or froze mid-attempt. | Check that worker's health. The receiver may have a duplicate. |
+| A worker logs `unexpected error` with a traceback | A bug, or a row edited by hand. | Read the traceback. The worker carries on, and the delivery it held is sent again when its claim expires. |
 | `409` on submit | A producer reused a key for different content. | Fix how the producer builds keys. |
 | `422` on submit | The request is invalid. | Read `detail` and fix the producer. |
 | The worker exits at start with a validation error | A setting is invalid, for example `CLAIM_TIMEOUT_SECONDS` is too small. | Fix the setting. |
@@ -719,7 +759,9 @@ exactly one more attempt.
 Do not edit other columns by hand:
 
 - **Lowering `attempt_count`** makes the next claim reuse an attempt number. The database rejects
-  that, and every worker that tries to claim the delivery stops with an error.
+  that, so every claim of that delivery fails. Workers log an `unexpected error` each time and
+  carry on, but the delivery stays first in line, so a single worker sends nothing else until the
+  row is fixed.
 - **Setting `processing`** without a claim token is rejected by the database.
 
 ### Data retention
@@ -737,6 +779,8 @@ deliveries (their attempts are deleted with them) is future work.
 - No metrics or structured logs yet; use the SQL queries above.
 - No replay endpoint and no cleanup of old rows.
 - The size of `data` is not limited.
+- No deadline for a whole attempt: a receiver that sends its status line a few bytes at a time can
+  outlast the claim, which causes a duplicate.
 - No ordering guarantee.
 
 Most of these are planned for milestone 5; see [ARCHITECTURE.md](../ARCHITECTURE.md#limitations-and-future-work).
@@ -745,11 +789,11 @@ Most of these are planned for milestone 5; see [ARCHITECTURE.md](../ARCHITECTURE
 
 | Term | Meaning |
 |---|---|
-| At least once | Every event is delivered, possibly more than once. The opposite trade-off, at most once, risks losing events. |
+| At least once | Every event is delivered, possibly more than once, as long as the receiver accepts it within the retry window. The opposite trade-off, at most once, risks losing events. |
 | Backoff | Waiting longer after each failure. |
 | Claim | A worker's temporary, expiring ownership of a delivery. |
-| Claim token | The ID of the attempt holding the claim. Only the holder may save a result. In general this is called a fencing token. |
-| Claim timeout | How long a claim lasts before another worker may take over. Message queues call this a visibility timeout. |
+| Claim token | The ID of the attempt holding the claim. Only the holder may save a result. In general this is called a fencing token. It guards the database, not the receiver. |
+| Claim timeout | How long a claim lasts. After that, another worker may take the delivery over; until one does, the original worker's result is still accepted. Message queues call this a visibility timeout. |
 | Fingerprint | A hash of a request's content, used to detect a key reused with different content. |
 | Idempotency key | A producer-chosen name for a request, so that repeating it has no extra effect. |
 | Jitter | Randomness added to retry waits so that many retries do not happen at the same moment. |
