@@ -13,7 +13,7 @@ Who should read what:
 | Building a receiver, an app that gets webhooks | [Receiving webhooks](#5-receiving-webhooks) |
 | Curious how it all fits together | [How a delivery flows](#6-how-a-delivery-flows) |
 | Managing producers, API keys and secrets | [Producers and API keys](#producers-and-api-keys), [Rotating the webhook secret](#rotating-the-webhook-secret) |
-| Keeping it healthy | [Operating the service](#8-operating-the-service) |
+| Keeping it healthy | [Operating the service](#8-operating-the-service), starting with [Health and readiness](#health-and-readiness) |
 
 ## Contents
 
@@ -71,6 +71,8 @@ What the service promises, in plain words:
 - **Every webhook is signed.** A receiver that checks the signature can refuse webhooks that were
   forged, changed on the way, or replayed later.
 - **Sending the same request twice is safe** if the producer includes an `Idempotency-Key` header.
+- **Nothing waits without a limit.** When the database is slow, stuck or gone, a request gets `503`
+  within seconds, and a worker logs the problem and tries again, instead of hanging.
 - **Events can arrive out of order.**
 
 ## 2. Running the service
@@ -136,17 +138,20 @@ Times are in the machine's local time. Other worker messages:
 | `failed (timeout), retrying in 9s` | No answer in time; the receiver may still have processed it. |
 | `failed (connection_error), retrying in 10s` | The receiver could not be reached. |
 | `result discarded; the claim expired and another worker took the delivery over` | This worker was so slow that its claim expired and another worker took over, so its result was not saved. |
-| `database unavailable, trying again in 1.0s` | PostgreSQL is down; the worker keeps polling. |
+| `database error (connection failed: …), trying again in 1.0s` | PostgreSQL cannot be reached; the worker keeps polling. At startup it waits like this until the database is up. |
+| `database error (canceling statement due to lock timeout), trying again in 1.0s` | Another transaction held a lock the worker needed for longer than `DATABASE_LOCK_TIMEOUT_SECONDS`. See [Troubleshooting](#troubleshooting). |
+| `database error (canceling statement due to statement timeout), trying again in 1.0s` | A statement took longer than `DATABASE_STATEMENT_TIMEOUT_SECONDS`, usually because the database is overloaded. |
 | `unexpected error, trying again in 1.0s`, with a traceback | A bug. The worker carries on with other deliveries; the one it held is sent again when its claim expires. |
 | `stopping after the current delivery`, then `stopped` | A clean stop after Ctrl+C or `SIGTERM`. |
 | `WEBHOOK_SECRETS is not set, and the worker does not send unsigned webhooks…`, and the worker exits | No webhook secret is configured. See [First-time setup](#first-time-setup). |
+| `The worker cannot start: the database schema is at revision 0003, and this version of the service needs 0004 or later…`, and the worker exits | The migrations have not been run. Run `uv run alembic upgrade head`, then start the worker again. |
 
 ### Watching it work: the demo
 
 `uv run python dev/demo.py` shows the guarantees with real processes. It needs PostgreSQL running,
 creates its own `webhooks_demo` database with two producers, carrental and friendster, and makes a
 webhook secret for the run. It then starts a test receiver, the API and a worker on free ports
-with short timeouts, and plays five scenes in about 20 seconds:
+with short timeouts, and plays six scenes in about 25 seconds:
 
 | Scene | What happens | What it shows |
 |---|---|---|
@@ -155,6 +160,7 @@ with short timeouts, and plays five scenes in about 20 seconds:
 | 3 | The receiver answers after 3 seconds; the worker waits 2. | A `timeout`, a retry, and the receiver processing the same `webhook-id` twice. |
 | 4 | The worker is killed with `SIGKILL` while it waits for the receiver. | The delivery stuck in `processing` until its claim expires, then `claim_expired` and delivery by a new worker. |
 | 5 | A request without a key; the same `Idempotency-Key` from both producers; friendster reading carrental's delivery; a 100 KB event. Then an attacker resends a captured webhook unchanged, with its body changed, with a new timestamp, and signed with a guessed secret. | `401`; two separate deliveries; `404`; `413`. The unchanged copy passes the signature check and is caught as a duplicate; the other three get `401`. |
+| 6 | A request freezes after storing an `Idempotency-Key`, without committing, and another request with that key arrives. Then a second API starts with a database it cannot reach, and a worker starts against a database without tables. | `503` after the 1-second lock timeout, while `/ready` stays `200`; PostgreSQL ends the frozen transaction after 3 idle seconds, and the key can be used. The second API answers `/health` with `200` and `/ready` with `503`. The worker exits at once, saying to run the migrations. |
 
 It prints each step, the worker's and the receiver's log lines, and each delivery's attempt
 history. The demo database is emptied at the start of every run and left in place afterwards, so
@@ -173,7 +179,7 @@ workers the same settings.
 | API | Ctrl+C | Stops accepting. Stored deliveries are unaffected. |
 | Worker | Ctrl+C or `kill <pid>` (`SIGTERM`) | Finishes the current delivery (at most a few seconds), then exits. |
 | Worker, forcibly | `kill -9 <pid>` | Stops at once. Its current delivery is retried by another worker after `CLAIM_TIMEOUT_SECONDS`. |
-| Database | `docker compose stop` | Data is kept. The API answers `503` and workers wait until it is back. |
+| Database | `docker compose stop` | Data is kept. The API answers `503`, `/ready` reports it not ready, and workers wait until it is back. |
 | Database container | `docker compose down` | The container is removed; the `pgdata` volume, and your data, are kept. |
 | All data | `docker compose down -v` | **Deletes the volume and every delivery.** |
 
@@ -181,6 +187,15 @@ workers the same settings.
 
 Stop the workers, update the code, then run `uv sync` and `uv run alembic upgrade head` before
 starting the processes again. Migrations are versioned in `alembic/versions`.
+
+The processes check the order. A worker started against a database whose migrations have not run
+exits with the revision it needs, and the API reports itself not ready (see
+[Health and readiness](#health-and-readiness)). A newer database is accepted, so code that is
+still running keeps working while a migration runs.
+
+A migration gives up if it waits more than `DATABASE_LOCK_TIMEOUT_SECONDS` for a lock, with
+`canceling statement due to lock timeout`. It changes nothing then, so run it again; if it keeps
+failing, find the long transaction in its way, as in [Troubleshooting](#troubleshooting).
 
 Milestone 5.1 (version 0.5.1) added API keys and signatures, so two more steps come before the
 restart: set `WEBHOOK_SECRETS` for the workers and the receiver, and create a producer and an API
@@ -293,14 +308,15 @@ what is wrong and where:
 Other examples are `extra_forbidden` with `loc: ["body", "url"]` for an unknown field, and
 `string_too_long` with `loc: ["header", "idempotency-key"]` for a key longer than 255 characters.
 
-**`503 Service Unavailable`**: the database could not be reached, or was too busy to hand out a
-connection in time.
+**`503 Service Unavailable`**: the database could not be reached, or did not finish in time:
+no pooled connection became free within `DATABASE_POOL_TIMEOUT_SECONDS`, or a statement or a wait
+for a lock ran out of time.
 
 ```http
 HTTP/1.1 503 Service Unavailable
 retry-after: 5
 
-{"detail": "Storage is unavailable, so it is not known whether the delivery was stored. Retry with the same Idempotency-Key."}
+{"detail": "Storage is unavailable or too busy, so it is not known whether the delivery was stored. Retry with the same Idempotency-Key."}
 ```
 
 Usually nothing was stored. But if the connection failed while the API was committing, the
@@ -454,8 +470,8 @@ Each attempt has:
 A producer can read only its own deliveries. An unknown ID returns `404` with
 `{"detail": "Delivery not found"}`, and so does the ID of another producer's delivery: the answer
 does not even confirm that the ID exists. A malformed ID returns `422`, a missing or invalid API
-key `401`, and if the database is unavailable, the answer is `503` with
-`{"detail": "Storage is unavailable. Retry later."}`.
+key `401`, and if the database is unavailable or too busy, the answer is `503` with
+`{"detail": "Storage is unavailable or too busy. Retry later."}`.
 
 ### Reading the history
 
@@ -493,7 +509,8 @@ refused the event. It is not retried.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health` | Returns `{"status": "ok"}` while the API process is up. It does not check the database. |
+| `GET /health` | Liveness: `{"status": "ok"}` while the API process is up. It does not use the database. |
+| `GET /ready` | Readiness: `{"status": "ready"}`, or `503` with a reason when the database cannot be reached or its schema is behind the code. See [Health and readiness](#health-and-readiness). |
 | `GET /docs` | Interactive API documentation. |
 | `GET /openapi.json` | The OpenAPI schema. |
 
@@ -774,7 +791,8 @@ This section follows one event from submission to its final state.
    - a key the producer used with the same content returns the original delivery;
    - a key the producer used with different content gets `409`.
 5. Only after the commit does it answer `202`, with the delivery ID and a `Location` header. If
-   the database cannot be reached, it answers `503`, and the producer retries with the same key.
+   the database cannot be reached, or a limit runs out, it answers `503`, and the producer retries
+   with the same key.
 
 The new delivery is `pending`, with `attempt_count` 0 and `next_attempt_at` set to now, so it is
 due immediately.
@@ -876,6 +894,11 @@ Environment variables win. Copy `.env.example` to start.
 | Variable | Default | Used by | Meaning |
 |---|---|---|---|
 | `DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks` | API, worker, migrations, `webhook-admin` | PostgreSQL connection. |
+| `DATABASE_CONNECT_TIMEOUT_SECONDS` | `5` | API, worker, `webhook-admin` | How long opening a connection may take. Whole seconds; the driver waits at least 2. |
+| `DATABASE_POOL_TIMEOUT_SECONDS` | `2` | API, worker | How long a request waits for a free connection from the pool before it gets `503`. |
+| `DATABASE_STATEMENT_TIMEOUT_SECONDS` | `5` | API, worker | How long one statement may run, waiting for locks included. PostgreSQL then cancels it. |
+| `DATABASE_LOCK_TIMEOUT_SECONDS` | `2` | API, worker, migrations | How long a statement may wait for a lock another transaction holds. Must be shorter than the statement timeout. Migrations give up after this long too. |
+| `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` | `10` | API, worker | How long a transaction may sit idle between statements before PostgreSQL ends the session and releases its locks. The service's own transactions never sit idle; this ends those of a process that froze. |
 | `MAX_EVENT_BYTES` | `65536` | API | The largest request body the API reads, in bytes. A larger one gets `413`. |
 | `WEBHOOK_SECRETS` | none | Worker, test receiver | Secrets to sign webhooks with, separated by spaces. Each is `whsec_` and 24 to 64 random bytes in base64; `uv run webhook-admin new-webhook-secret` makes one. The worker does not start without one. Two only during a [rotation](#rotating-the-webhook-secret). |
 | `RECEIVER_URL` | `http://127.0.0.1:9000/webhooks` | Worker | The only destination. Deliveries waiting for a retry go to the value a worker has when it sends them, so changing it moves them to the new receiver. Give every worker the same value. |
@@ -902,8 +925,38 @@ Some guidance:
   few bytes at a time can still outlast any claim, which causes a duplicate.
 - **Delivery timeout:** raise it only if the receiver is legitimately slow, and raise
   `CLAIM_TIMEOUT_SECONDS` with it.
+- **Database limits:** the service's statements take milliseconds, so the defaults leave a wide
+  margin. Raise the statement timeout only if a healthy database needs longer, and keep the lock
+  timeout short: a request that waits for a lock holds a thread and a pooled connection all that
+  time. The service's connections also send TCP keepalives, so a connection that died without a
+  word fails within about 25 seconds; that is fixed in `db.py`.
 
 ## 8. Operating the service
+
+### Health and readiness
+
+The API has two checks, for whatever starts it and routes traffic to it, such as a load balancer
+or Kubernetes:
+
+| Endpoint | Answers | Use it to |
+|---|---|---|
+| `GET /health` | `200 {"status": "ok"}` whenever the process answers. It does not use the database. | Restart the API if it stops answering. |
+| `GET /ready` | `200 {"status": "ready"}`, or `503` with a reason. | Send traffic only to ready instances. Do not restart one for being unready. |
+
+`/ready` answers `503` in two cases:
+
+```json
+{"status": "not ready", "detail": "the database is unavailable or too busy"}
+```
+
+```json
+{"status": "not ready", "detail": "the database schema is at revision 0003, and this version of the service needs 0004 or later. Run `uv run alembic upgrade head`."}
+```
+
+Neither needs an API key. Keep `/health` free of the database: while the database is down,
+restarting the API would not bring it back. In a probe with the database stopped, `/health`
+answered `200` and `/ready` answered `503` within a few milliseconds, and `/ready` was `200`
+again as soon as the database was back.
 
 ### Producers and API keys
 
@@ -996,6 +1049,14 @@ FROM delivery_attempts WHERE delivery_id = '<delivery id>' ORDER BY number;
 SELECT coalesce(outcome, 'in progress') AS outcome, count(*)
 FROM delivery_attempts WHERE started_at > now() - interval '1 hour'
 GROUP BY 1 ORDER BY 1;
+
+-- Sessions that block others, or have kept a transaction open for more than 10 seconds.
+SELECT pid, pg_blocking_pids(pid) AS blocked_by, state, now() - xact_start AS open_for,
+       left(query, 60) AS last_query
+FROM pg_stat_activity
+WHERE datname = current_database()
+  AND (cardinality(pg_blocking_pids(pid)) > 0 OR xact_start < now() - interval '10 seconds');
+-- To end one: SELECT pg_terminate_backend(<pid>);
 ```
 
 The most useful single number is `oldest_due_waiting`. If it keeps growing, workers are missing,
@@ -1010,7 +1071,11 @@ so in rare cases it is another source of duplicates.
 | Symptom | Likely cause | What to do |
 |---|---|---|
 | `POST` returns `503` | PostgreSQL is unreachable. | Run `docker compose ps` and start the database. Producers retry by themselves, with the same key. |
-| `POST` returns `503` after about 30 seconds while the database is up | Every pooled database connection is busy. | The API or the database is overloaded. Producers retry; add capacity if it persists. |
+| `POST` returns `503` after about `DATABASE_POOL_TIMEOUT_SECONDS` while the database is up | Every pooled database connection is busy. | The API or the database is overloaded. Producers retry; add capacity if it persists. |
+| Requests with one `Idempotency-Key` get `503` after about `DATABASE_LOCK_TIMEOUT_SECONDS`, while others work | A transaction that stored that key has not ended: a stuck request, or someone's open `psql` session. | Find it with the blocking-sessions query in [Checking health with SQL](#checking-health-with-sql), and end it. A frozen request of the service is ended by PostgreSQL after `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS`. |
+| A worker logs `database error (canceling statement due to lock timeout)` | Another transaction held a lock on a delivery for too long, often a manual one. | As above. The worker carries on; a delivery whose result could not be saved is sent again when its claim expires. |
+| `/ready` answers `503` while `/health` answers `200` | The database cannot be reached or is too busy, or its schema is behind the code. | Read `detail`: start the database, or run the migrations. |
+| `alembic upgrade head` fails with `canceling statement due to lock timeout` | A long transaction is using a table the migration changes. Waiting would hold up every query on that table. | Run it again. If it keeps failing, find and end the long transaction first. |
 | Every request gets `401` | The API key is missing, mistyped or revoked, or was created in another database. | Run `uv run webhook-admin list` with the API's `DATABASE_URL`, and create a new key if needed. |
 | `POST` returns `413` | The event is larger than `MAX_EVENT_BYTES`. | Send less data, such as IDs, or raise the limit. |
 | Deliveries stay `pending`, and `oldest_due_waiting` grows | No worker is running, or workers cannot reach the database. | Start workers and read their logs. |
@@ -1025,6 +1090,7 @@ so in rare cases it is another source of duplicates.
 | `422` on submit | The request is invalid. | Read `detail` and fix the producer. |
 | The worker or the API exits at start with a validation error; the API also logs `Application startup failed` | A setting is invalid, for example `CLAIM_TIMEOUT_SECONDS` is too small or a secret is malformed. The message names the setting, not its value. | Fix the setting. |
 | The worker exits at start: `WEBHOOK_SECRETS is not set` | No webhook secret is configured. | See [First-time setup](#first-time-setup). |
+| The worker exits at start: `The worker cannot start: the database schema is at revision …` or `the database has no tables yet` | The migrations have not been run on its database, or `DATABASE_URL` names another database. | Run `uv run alembic upgrade head` with the same `DATABASE_URL`. |
 
 ### Replaying a failed delivery
 
@@ -1039,6 +1105,11 @@ WHERE id = '<delivery id>' AND status = 'failed';
 The next free worker sends it with the same `webhook-id`, and the history keeps the earlier
 attempts. `attempt_count` is not reset, so if it is already at `MAX_ATTEMPTS`, the delivery gets
 exactly one more attempt.
+
+The service's limits do not apply to your own `psql` session. Keep manual transactions short, or
+better, run single statements without `BEGIN`: while your transaction holds a row, the service's
+requests and workers that need it give up after `DATABASE_LOCK_TIMEOUT_SECONDS`. Running
+`SET lock_timeout = '2s';` first also keeps your statement from waiting behind the service.
 
 Do not edit other columns by hand:
 
@@ -1065,6 +1136,11 @@ deliveries (their attempts are deleted with them) is future work.
 - No replay endpoint and no cleanup of old rows.
 - No deadline for a whole attempt: a receiver that sends its status line a few bytes at a time can
   outlast the claim, which causes a duplicate.
+- A database that freezes while its network stack keeps answering, as a paused container does,
+  holds up queries already sent until it resumes. New connections still give up after
+  `DATABASE_CONNECT_TIMEOUT_SECONDS`. Monitor the database itself.
+- Requests waiting for one of the API's threads are not limited: under overload they queue in the
+  server.
 - No ordering guarantee.
 - HTTPS is left to the deployment: a reverse proxy in front of the API, and an `https://`
   `RECEIVER_URL`.
@@ -1079,6 +1155,7 @@ Several of these are planned for the rest of milestone 5; see
 | API key | A producer's credential, sent as a bearer token. The service stores only its SHA-256 hash. |
 | At least once | Every event is delivered, possibly more than once, as long as the receiver accepts it within the retry window. The opposite trade-off, at most once, risks losing events. |
 | Backoff | Waiting longer after each failure. |
+| Blocking session | A session holding a lock that another session waits for. `pg_blocking_pids` lists them. |
 | Bearer token | A credential sent as `Authorization: Bearer <token>`. Whoever holds it is let in, so it must stay secret. |
 | Claim | A worker's temporary, expiring ownership of a delivery. |
 | Claim token | The ID of the attempt holding the claim. Only the holder may save a result. In general this is called a fencing token. It guards the database, not the receiver. |
@@ -1087,11 +1164,18 @@ Several of these are planned for the rest of milestone 5; see
 | Fingerprint | A hash of a request's content, used to detect a key reused with different content. |
 | HMAC | A hash computed with a secret key. Only a holder of the key can compute it, so a matching HMAC proves who sent the content and that it did not change. |
 | Idempotency key | A producer-chosen name for a request, so that repeating it has no extra effect. |
+| Idle in transaction | A session that began a transaction and is not running a statement. It keeps its locks until the transaction ends. |
 | Jitter | Randomness added to retry waits so that many retries do not happen at the same moment. |
+| Keepalive | A small TCP probe sent over a silent connection to check that the other side is still there. |
+| Liveness | Whether a process is alive and answering. A failed liveness check means: restart it. |
+| Lock queue | The line of sessions waiting for locks on a table. One waiting for an exclusive lock, such as a migration, makes every later query wait behind it. |
+| Lock timeout | How long a statement may wait for a lock before PostgreSQL cancels it. |
 | Outbox | A table where a producer saves events in the same transaction as the change that caused them, for a relay to send later. |
 | Poison delivery | A delivery that fails or crashes every attempt. Attempt limits stop it. |
+| Readiness | Whether a process can serve requests now. A failed readiness check means: send traffic elsewhere, not restart. |
 | Replay attack | Resending a captured, genuine request. A signature alone does not stop it; the age check and the `webhook-id` check do. |
 | Secret rotation | Replacing a secret without downtime, by signing with, or accepting, both the old and the new one for a while. |
 | `SKIP LOCKED` | PostgreSQL's option to pass over rows another transaction has locked, instead of waiting. |
+| Statement timeout | How long one statement may run, lock waits included, before PostgreSQL cancels it. |
 | `webhook-id` | The delivery ID, sent with every attempt so that receivers can detect duplicates. |
 | Webhook secret | The `whsec_` secret that workers sign webhooks with and the receiver checks them with. |

@@ -1,4 +1,5 @@
 import json
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
@@ -156,6 +157,39 @@ def test_a_key_released_by_a_rolled_back_request_is_stored_by_the_waiting_one(
     assert response.json()["delivery_id"] != str(other_id)
     with db.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM deliveries")) == 1
+
+
+def test_a_request_that_waits_too_long_for_a_lock_gets_503(client, db, short_limits_engine):
+    def short_limits_session():
+        with Session(short_limits_engine, expire_on_commit=False) as session:
+            yield session
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    with db.connect() as stuck:
+        # A request that inserted KEY and then froze before committing.
+        stuck.execute(
+            text(
+                "INSERT INTO deliveries (id, producer_id, event_type, payload, idempotency_key)"
+                " SELECT gen_random_uuid(), id, 'booking.confirmed', '{}', :key"
+                " FROM producers WHERE name = 'carrental'"
+            ),
+            {"key": KEY["Idempotency-Key"]},
+        )
+        app.dependency_overrides[get_session] = short_limits_session
+        started = time.monotonic()
+        try:
+            response = pool.submit(client.post, "/deliveries", json=EVENT, headers=KEY).result(
+                timeout=10
+            )
+        finally:
+            elapsed = time.monotonic() - started
+            stuck.rollback()
+            pool.shutdown(wait=False)
+
+    # Without a lock timeout, the request would wait for as long as the stuck transaction lasts.
+    assert response.status_code == 503
+    assert elapsed < 5
+    assert "Retry with the same Idempotency-Key" in response.json()["detail"]
 
 
 class CommitThenConnectionLost(Session):

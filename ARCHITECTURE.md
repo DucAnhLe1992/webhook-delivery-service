@@ -15,6 +15,7 @@ the [user manual](docs/USER_MANUAL.md). To see how the design grew one guarantee
 - [Flows](#flows)
 - [Concurrency control](#concurrency-control)
 - [Retry policy](#retry-policy)
+- [Bounded waits](#bounded-waits)
 - [Security model](#security-model)
 - [Guarantees and failure modes](#guarantees-and-failure-modes)
 - [Design decisions](#design-decisions)
@@ -61,12 +62,13 @@ database directly.
 
 | Component | Owns | Does not own |
 |---|---|---|
-| API: `main.py`, `api/deliveries.py` | Request validation, idempotent submission, reading deliveries, mapping errors to `409`, `422` and `503`, checking the settings at startup | Sending webhooks |
+| API: `main.py`, `api/deliveries.py`, `api/health.py` | Request validation, idempotent submission, reading deliveries, mapping errors to `409`, `422` and `503`, checking the settings at startup, liveness and readiness | Sending webhooks |
 | API guards: `api/dependencies.py`, `api/body_limit.py` | The producer behind the API key (`401` otherwise), and the body-size limit (`413`) | Deciding what a producer may see: the service layer filters by producer |
 | Service layer: `services/delivery_service.py` | Every delivery transaction: create, read, claim and record, each scoped to the producer where a producer is involved | HTTP on either side |
 | Producers: `services/producer_service.py` | Producers and API keys: create, hash, look up, revoke | Any delivery |
 | Admin command: `admin.py` | `webhook-admin`: producers, API keys and new webhook secrets | HTTP; it works on the database directly |
-| Worker: `worker/main.py` | The loop (claim, send, record, wait), logging, clean stop on `SIGINT`/`SIGTERM`, carrying on through database outages and unexpected errors | Deciding what an attempt means: `sender.py` classifies it, `retry.py` sets the delay, and the service layer applies the attempt limit |
+| Database access: `db.py`, `schema.py` | The engine and the limits on every wait, sessions, telling an unavailable database from a bug, and the schema revision the code needs | Transactions, which the service layer owns |
+| Worker: `worker/main.py` | The loop (claim, send, record, wait), logging, clean stop on `SIGINT`/`SIGTERM`, waiting for the database and checking its schema at startup, carrying on through database outages and unexpected errors | Deciding what an attempt means: `sender.py` classifies it, `retry.py` sets the delay, and the service layer applies the attempt limit |
 | Sender: `sender.py` | One signed HTTP attempt, classified by the status code alone; the response body is never read | Database state |
 | Signing: `signing.py` | Standard Webhooks signatures: secrets, signing, and the verification receivers do | Where the secrets come from: `WEBHOOK_SECRETS` |
 | Retry policy: `retry.py` | The delay before the next attempt | Whether to retry at all, which depends on the outcome and the attempt limit |
@@ -79,6 +81,8 @@ database directly.
 ```mermaid
 flowchart TD
     API[api/deliveries.py] --> DEP[api/dependencies.py]
+    HLT[api/health.py] --> SCH[schema.py]
+    WRK[worker/main.py] --> SCH
     DEP --> PRD[services/producer_service.py]
     ADM[admin.py] --> PRD
     API --> SVC[services/delivery_service.py]
@@ -99,7 +103,7 @@ flowchart TD
 use its states and outcomes, and it uses none of them. In particular, the database models do not
 depend on the HTTP sender.
 
-Five rules keep the layers honest:
+Six rules keep the layers honest:
 
 1. **The service layer owns the transactions.** HTTP handlers, the worker loop and the admin
    command contain no SQL and never commit; each service function commits its own work before it
@@ -116,6 +120,10 @@ Five rules keep the layers honest:
 5. **No secret is stored or printed in a usable form.** API keys are stored as hashes and shown
    once, webhook secrets live only in the environment, and a settings error never repeats the
    value it rejects.
+6. **Every wait has a limit.** Every connection the service opens carries limits on statements,
+   lock waits and idle transactions, and every wait for a connection is bounded too. When a limit
+   runs out, the API answers `503` and the worker tries again. See
+   [Bounded waits](#bounded-waits).
 
 ## Data model
 
@@ -264,7 +272,9 @@ Migrations live in `alembic/versions`:
 | `0004` | `producers`, `api_keys` and `deliveries.producer_id`, with idempotency keys unique per producer. Deliveries stored before it are given a producer named `legacy`, created only if there are any, before the column becomes required. |
 
 CI runs `alembic upgrade head` and `alembic check`, so a model change without a migration fails the
-build.
+build. Migrations are numbered `0001`, `0002` and so on, and `schema.REQUIRED_REVISION` names the
+newest one the code needs; a test checks both. A migration waits at most
+`DATABASE_LOCK_TIMEOUT_SECONDS` for each lock; see [the lock queue](#the-lock-queue-and-migrations).
 
 ## Delivery state machine
 
@@ -515,6 +525,144 @@ With the defaults (10-second base, 1-hour cap, 8 attempts), give or take 20%:
 | 7 | about 10.5 min | 640 s |
 | 8 | about 21 min | none; the delivery becomes `failed` |
 
+## Bounded waits
+
+A wait without a limit turns one stuck transaction, a frozen process or a broken network into
+requests and workers that pile up until nothing answers. With a limit, the same fault becomes a
+quick error with a known way on: the API answers `503` and the producer retries, and the worker
+logs the error and tries again on its next poll.
+
+| Wait | Who waits | Limit | Default | When it runs out |
+|---|---|---|---|---|
+| Opening a database connection | API, worker, `webhook-admin` | `DATABASE_CONNECT_TIMEOUT_SECONDS` | 5 s | The connection fails: `503`, or the worker tries again. |
+| A free connection from the pool | API, worker | `DATABASE_POOL_TIMEOUT_SECONDS` | 2 s | `503`, or the worker tries again. |
+| One statement, waiting for locks included | API, worker | `DATABASE_STATEMENT_TIMEOUT_SECONDS` | 5 s | PostgreSQL cancels it, and its transaction rolls back: `503`, or the worker tries again. |
+| A lock that another transaction holds | API, worker | `DATABASE_LOCK_TIMEOUT_SECONDS` | 2 s | As for a statement. |
+| A lock, in a migration | `alembic upgrade` | `DATABASE_LOCK_TIMEOUT_SECONDS` | 2 s | The migration fails and rolls back. Run it again later. |
+| A transaction of the service's that sits idle between statements, holding its locks, because its process froze | Everyone who needs those locks | `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` | 10 s | PostgreSQL ends that session, which releases its locks. Other sessions, such as an operator's, are not limited. |
+| An answer over a network that died without a word | API, worker | TCP keepalives and `TCP_USER_TIMEOUT`, set in `db.py` | about 25 s | The connection fails. |
+| Each network step of an attempt | Worker | `DELIVERY_TIMEOUT_SECONDS` | 5 s | The attempt is a `timeout`, and is retried. |
+| The claim of a worker that died | Other workers | `CLAIM_TIMEOUT_SECONDS` | 60 s | Another worker takes the delivery over. |
+| The database, while a worker starts | Worker | None, on purpose | | It tries again every `POLL_INTERVAL_SECONDS` and logs each try. A database that starts after the worker is normal. |
+| A slow client reading its response | Nobody | Not needed | | The request's session ends before the response is sent, so it holds nothing. |
+
+### Limits set on every connection
+
+`db.create_db_engine` passes the three PostgreSQL limits as startup options of every connection
+(`-c statement_timeout=5000` and so on), and sets the pool timeout, the connect timeout and the
+TCP settings. The API, the worker, `webhook-admin` and the tests all build their engines with it.
+The limits hold for every statement the service runs and for nothing else, so an operator's own
+`psql` session, which may legitimately run a long maintenance statement, is not cut short.
+
+- The lock timeout must be shorter than the statement timeout. Waiting for a lock counts towards
+  the statement timeout, so a lock timeout that is not shorter would never be reached. The
+  settings refuse it.
+- A statement that runs out of time is cancelled with `QueryCanceled` or `LockNotAvailable`,
+  which SQLAlchemy raises as `OperationalError`. That is the class an unreachable database
+  raises, which the API's `503` handler and the worker already handled, so a timeout is treated
+  the same way: the producer retries with the same `Idempotency-Key`, and the worker tries again.
+- The idle-in-transaction timeout is different: PostgreSQL ends the whole session, and the next
+  statement on it raises `InternalError`, with the connection marked as invalidated.
+  `db.storage_unavailable` counts that as the database being unavailable, not as a bug, so the
+  worker logs it as a database error. The pool replaces the connection.
+- The worker's log names the reason, such as `database error (canceling statement due to lock
+  timeout)`, so a lock held too long is not mistaken for an outage.
+
+### The lock queue and migrations
+
+PostgreSQL grants the locks on a table in the order they were asked for. `ALTER TABLE` needs an
+exclusive lock, so a migration waits until every open transaction that has used the table ends.
+While it waits, it holds a place in the queue, and every later query on that table waits behind
+it, even a plain `SELECT` that does not conflict with the transaction the migration waits for:
+
+```mermaid
+sequenceDiagram
+    participant L as Long transaction
+    participant M as Migration
+    participant A as API request
+    participant D as PostgreSQL
+    L->>D: SELECT count(*) FROM deliveries, and the transaction stays open
+    M->>D: ALTER TABLE deliveries ADD COLUMN ...
+    Note over M,D: needs an exclusive lock, so waits for L
+    A->>D: SELECT ... FROM deliveries
+    Note over A,D: waits behind M, although it does not conflict with L
+    Note over M: after DATABASE_LOCK_TIMEOUT_SECONDS, M gives up and rolls back
+    D-->>A: the queue moves on
+```
+
+Measured on a copy of the schema at `0003`: while migration `0004` waited for one open reader, an
+ordinary `SELECT` waited behind it for as long as the reader stayed open, 5 seconds in the probe.
+One forgotten transaction can therefore stop every request through a migration that is only
+waiting. So `alembic/env.py` gives migrations the lock timeout too. In the same probe, the
+migration then gave up after 2.0 seconds, the `SELECT` finished at 2.0 seconds, the database was
+still at `0003`, and running the migration again once the reader had ended succeeded.
+Migrations get no statement timeout: changing data may take as long as it needs. A migration that
+gives up changes nothing, because PostgreSQL runs schema changes in a transaction.
+
+### Sessions end before the response is sent
+
+In FastAPI 0.165, a dependency with `yield` ends after the response has been sent, unless it is
+declared with `scope="function"`. The database session was such a dependency, so every request
+kept its pooled connection, and its transaction with the locks it held, while the response
+traveled to the client. A client reading slowly, or not at all, held them for as long as it
+liked. `SessionDep` now uses `scope="function"`: the session closes as soon as the route function
+returns. The route functions build their whole response first, so nothing reads the database
+later. A test wraps the app and checks that no pooled connection is in use when the response
+starts.
+
+### Dead and frozen connections
+
+If the database host dies, or the network to it breaks, nothing tells the client: TCP just waits.
+By default, Linux sends the first keepalive probe after two hours of silence, and retransmits
+data that is never acknowledged for about fifteen minutes. `db.py` sets keepalive probes after
+10 seconds of silence, every 5 seconds, and a `TCP_USER_TIMEOUT` of 25 seconds, after which a
+connection that hears nothing back fails.
+
+This was measured with a throwaway PostgreSQL container cut off its Docker network. One query
+was waiting for its answer when the network was cut, and another was sent afterwards:
+
+| Connection settings | Waiting for an answer | Sent after the cut |
+|---|---|---|
+| The service's | Failed after 25 seconds | Failed after 26 seconds |
+| libpq's defaults | Still waiting after 90 seconds | Still waiting after 90 seconds |
+
+The client ran in a container on the same network. From the host, Docker Desktop's port
+forwarding answers TCP on the container's behalf, so the cut would not have been visible.
+
+A database that stops working while its network stack keeps answering, as a paused container
+does, cannot be noticed this way: the probes are answered. With a paused container, a new
+connection still failed after the connect timeout, 5.0 seconds, because the server never
+finished the handshake. But a query already sent on an open connection waited for the whole
+pause, 20 seconds, and finished once the container resumed. `statement_timeout` cannot help,
+because the frozen server keeps that clock. A deadline on every query, kept by the client, would
+need asynchronous database access with cancellation. At this scale the remedy is to monitor the
+database itself.
+
+### Liveness, readiness and the schema
+
+| Endpoint | Question | Checks | Used to |
+|---|---|---|---|
+| `GET /health` | Is the process alive? | Nothing outside the process | Restart an API that stopped answering |
+| `GET /ready` | Can it serve requests now? | That a pooled connection can be had, and that the schema is recent enough | Send it traffic, or not |
+
+- `/health` does not use the database. If it did, a database outage would make every API instance
+  look dead, and restarting them all would not bring the database back. It would only add
+  restarts and dropped requests to the outage.
+- `/ready` answers `503` with a reason when the database is unavailable or too busy, or when its
+  schema is behind the code. It needs no API key, because whatever routes traffic calls it.
+- "Recent enough" means at least `schema.REQUIRED_REVISION`, not exactly it. Migrations run
+  before new code replaces old code, so for a while old code runs against the newer schema, and
+  each migration must keep it working: add first, and remove only once no code uses the old
+  shape. If old code went unready as soon as a migration ran, every deploy would take the service
+  down. Revisions are numbered in order, so comparing their numbers tells which is later; a test
+  keeps them that way.
+- The worker checks the same thing when it starts. If the database cannot be reached, it waits
+  and tries again: a database that starts after the worker is normal. If the schema is behind, it
+  exits with the revision it needs. Every claim would fail, and before 5.2 the worker logged that
+  same error on every poll, for as long as nobody noticed.
+- The API does not refuse to start against an old schema. It must stay up to answer `/health`
+  and `/ready`, and readiness keeps traffic away from it until the migrations have run.
+
 ## Security model
 
 Trust crosses three boundaries, and each has its own proof:
@@ -651,13 +799,25 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
    changed and replayed ones.
 9. **Isolation.** Only requests with an active API key are served. A producer reads only its own
    deliveries, and its idempotency keys cannot collide with another producer's.
+10. **Bounded waits.** Every wait on the database has a limit, with one exception: a query already
+    sent to a database that freezes while its network stack keeps answering waits until it
+    resumes.
 
 | What fails | What happens | Result |
 |---|---|---|
 | API process crashes | Accepted deliveries are already committed, and workers keep sending | A producer whose request was cut off retries; its `Idempotency-Key` prevents a second copy. |
-| PostgreSQL unreachable | The API answers `503` with `Retry-After`; workers log "database unavailable" and poll again | Nothing new is accepted or sent until it returns. No restart is needed, because pooled connections are checked before use. |
+| PostgreSQL unreachable | The API answers `503` with `Retry-After`, and `/ready` answers `503` while `/health` stays `200`; workers log a database error and poll again | Nothing new is accepted or sent until it returns. No restart is needed, because pooled connections are checked before use. |
 | The connection fails during the API's `COMMIT` | The API answers `503`, although the delivery may be stored | The producer's retry with the same key finds it and gets it back, marked `Idempotent-Replayed`. |
-| Every pooled database connection is busy | The API waits up to 30 seconds for one, then answers `503` | Producers retry. |
+| Every pooled database connection is busy | The API waits up to `DATABASE_POOL_TIMEOUT_SECONDS` for one, then answers `503` | Producers retry. |
+| A transaction holds a lock that a request needs | The request waits up to `DATABASE_LOCK_TIMEOUT_SECONDS`, then answers `503` | The producer retries with the same key. Other requests are not held up. |
+| A process freezes in the middle of a transaction | PostgreSQL ends its session after `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` | Its locks are released and its work is rolled back. A worker's lost claim or result is recovered as after a crash. |
+| A statement runs too long, for example in an overloaded database | PostgreSQL cancels it after `DATABASE_STATEMENT_TIMEOUT_SECONDS` | `503`, or the worker tries again. |
+| A migration waits behind a long transaction | It gives up after `DATABASE_LOCK_TIMEOUT_SECONDS` and rolls back | Requests are held up at most that long. Run the migration again. |
+| The network to the database dies without a word | Connections fail after about 25 seconds | `503`, or the worker tries again. |
+| The database freezes, its network stack still answering | New connections fail after `DATABASE_CONNECT_TIMEOUT_SECONDS`; queries already sent wait | They finish when it resumes. A known gap: monitor the database. |
+| The database's schema is behind the code | `/ready` answers `503` with the reason; a worker that starts exits, naming the revision it needs | Run the migrations. |
+| The database is down when a worker starts | The worker waits, logging each try | It starts working once the database is back. |
+| A client reads its response slowly | The request's session has already ended | Nothing waits for that client. |
 | Receiver down, 5xx, 408, 429 or timeout | Retried with growing delays, up to `MAX_ATTEMPTS` | Then `failed`, which is visible. |
 | Receiver answers another 4xx or a 3xx | `failed` immediately | Visible as `permanent_failure`. |
 | Receiver sends a large, slow or corrupt response body | The body is never read | The attempt is classified by its status code. |
@@ -719,6 +879,17 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
 | The body limit as ASGI middleware | A FastAPI dependency, or a reverse proxy only | FastAPI reads the whole body before any dependency runs. A proxy limit is a good extra layer, but the service should not rely on one. |
 | `webhook-admin` working on the database | An administration endpoint | No administrator credential to protect, and nothing more exposed over HTTP. |
 | A `legacy` producer for deliveries stored before 5.1 | Delete them, or allow deliveries without a producer | History is kept, and `producer_id` can be required. |
+| Database limits set on each connection | On the database role or the database (`ALTER ROLE … SET`) | They travel with the code and are tested, and they do not cut short an operator's own maintenance statements. |
+| A lock timeout shorter than the statement timeout | One limit for both | A lock wait counts towards the statement timeout, so an equal or longer lock timeout would never be reached. The error then also says which limit ran out. |
+| Migrations get the lock timeout, but no statement timeout | No limits for migrations | A migration waiting for a lock holds up every query on the table behind it. Changing data may take long. |
+| No `transaction_timeout` (PostgreSQL 17) | A limit on whole transactions | The service's transactions are a few short statements, which the statement and idle limits already bound, and it would end the session rather than the statement. |
+| `/health` without the database | One check that includes the database | A database outage must not make every API instance look dead, because restarting them would not help. |
+| Readiness accepts a newer schema | Only the exact revision | Old code keeps serving while a migration runs during a deploy. |
+| The worker waits for the database, but exits on an old schema | The same answer for both | A database that starts later is normal. An old schema needs a person, and waiting would only repeat the same error. |
+| The API starts against an old schema and reports not ready | Refuse to start | It must keep answering `/health` and `/ready`. |
+| The session closes before the response is sent | FastAPI's default, after | A slow client would hold a pooled connection, and an open transaction with its locks. |
+| TCP keepalives and `TCP_USER_TIMEOUT` | The operating system's defaults | A connection that died without a word fails in about 25 seconds instead of minutes or hours. |
+| No deadline kept by the client on each query | Asynchronous database access with cancellation | Synchronous code is simpler. A frozen database is found by monitoring it. |
 | One configured destination | Destinations chosen by producers | Avoids server-side request forgery. Arbitrary destinations need URL validation, redirect rules and per-destination credentials. |
 | Synchronous code | `async` throughout | Simpler to reason about and test. Throughput comes from running more workers. |
 | HTTPX2 | HTTPX | The maintained continuation of HTTPX, by Pydantic, with the same API. |
@@ -727,8 +898,9 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
 ## Testing strategy
 
 - **Unit tests** need no database: attempt classification, the webhook headers, body and
-  signature, retry delays and the hard cap, configuration checks, and both `503` answers with an
-  unreachable database.
+  signature, retry delays and the hard cap, configuration checks, the migration numbering, both
+  `503` answers, liveness and readiness with an unreachable database, and a worker waiting for
+  one.
 - **Signature tests** reproduce the Standard Webhooks reference signature, and check that
   verification refuses a changed body or ID, another secret, an old or future timestamp, a
   refreshed timestamp, and a missing signature; that a webhook signed with two secrets verifies
@@ -742,7 +914,7 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
   behavior they check happens in the network layer that a mock transport replaces: a timeout, a
   connection dropped without an answer, and a body that is slow, huge or corrupt.
 - **Integration tests** run against real PostgreSQL, migrated with the real Alembic migrations,
-  and emptied before each test. The tests refuse a database whose name does not end in `_test`,
+  with the service's own database limits, and emptied before each test. The tests refuse a database whose name does not end in `_test`,
   or the one `DATABASE_URL` names, because they delete all its data.
 - **Race tests are deterministic.** One connection holds a real row lock, and the test waits until
   `pg_stat_activity` reports the other blocked, or sets a `lock_timeout` so a wrong wait fails
@@ -752,6 +924,12 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
   - two requests with the same idempotency key at the same moment, with the same or different
     content, and a waiting request whose rival rolls back;
   - a late result arriving while a takeover holds the row lock.
+- **Limit tests** run into each limit on purpose, with an engine whose limits are cut to
+  fractions of a second: a statement, a lock wait, a pooled connection and an idle transaction;
+  a request and a worker held up by a lock; a migration behind an open reader; and that no
+  connection is held while a response is sent. Readiness and the worker's startup check are
+  tested with code older than, as old as, and newer than the database, and with a database
+  that has no tables.
 - **Uncertain outcomes** have their own tests: a commit that succeeds before the connection
   fails, a full connection pool, a database failure while a result is saved, and an unexpected
   error in the worker loop.
@@ -765,11 +943,19 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
   revocation check, hashing, both producer filters, the signed timestamp, the age check, checking
   only the first signature, signing other bytes than those sent, sending no signature, the
   producer's name, the startup check, secrets in errors, the body limit, and counting a chunked
-  body.
+  body. Milestone 5.2 added sixteen more: each of the four database limits, the error
+  classification both ways, the session's scope, readiness without the schema check and when
+  storage is down, an exact-match schema check, a stale required revision, the worker's startup
+  check, its waiting for the database and its error logging, the migration lock timeout, and the
+  settings rule.
 - **Interoperability** was checked outside the suite: the specification's Python and JavaScript
   libraries, and the TypeScript and Python examples in the user manual, accept the service's
   webhooks and refuse tampered ones.
-- **A demo**, `dev/demo.py`, runs the real processes and kills a real worker. It is a
+- **Failure probes** were run outside the suite, against a throwaway PostgreSQL container: a
+  stopped, a paused and a disconnected database, with a real API and worker, or with a client in
+  a container on the same network. Their results are in [Bounded waits](#bounded-waits).
+- **A demo**, `dev/demo.py`, runs the real processes, kills a real worker and freezes a
+  transaction. It is a
   demonstration rather than a CI test, because it depends on timing.
 - **CI** (GitHub Actions) runs Ruff, the format check, `alembic upgrade head`, `alembic check`
   and the whole test suite against a PostgreSQL service container.
@@ -778,17 +964,14 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
 
 Planned for the rest of milestone 5:
 
-- **5.2, bounded waits:** a time budget for every database operation (statement and lock
-  timeouts, and a shorter wait for a pooled connection than SQLAlchemy's default 30 seconds), a
-  readiness endpoint that checks the database next to `/health`, and a worker that checks the
-  schema at startup instead of logging an error on every poll.
 - **5.3, observability and operations:** structured logs; metrics such as the age of the oldest
   due delivery, the retry rate and failures; an operator endpoint to replay failed deliveries;
   and a retention job, which must keep deliveries longer than producers may retry, because
   deleting a delivery frees its idempotency key.
 - **5.4, deployment:** a container image with API and worker entry points, migrations as a
-  deploy step, a shutdown grace period longer than an attempt, backups, a runbook, and static
-  type checking in CI.
+  deploy step that is retried when it gives up on a lock, a shutdown grace period longer than an
+  attempt, a limit on concurrent requests at the server, backups, a runbook, and static type
+  checking in CI.
 
 Known gaps:
 
@@ -799,4 +982,7 @@ Known gaps:
   so a receiver that sends its status line a few bytes at a time can outlast the claim. The cost
   is a duplicate, never a corrupted state. A true deadline needs `async` cancellation or a custom
   transport.
-- `/health` reports that the API process is up; it does not check the database.
+- A query already sent to a database that freezes while its network stack keeps answering waits
+  until the database resumes. See [Dead and frozen connections](#dead-and-frozen-connections).
+- A request waiting for one of the API's threads is not limited: under overload, requests queue
+  inside the server. A limit on concurrent requests is planned for 5.4.

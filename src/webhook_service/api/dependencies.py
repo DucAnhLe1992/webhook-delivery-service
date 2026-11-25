@@ -10,7 +10,10 @@ from webhook_service.db import get_session
 from webhook_service.models import Producer
 from webhook_service.services import producer_service
 
-SessionDep = Annotated[Session, Depends(get_session)]
+# The session closes when the route function returns, before the response is sent. By
+# default it would stay open while the response travels to the client, so a slow client would
+# keep a pooled connection, and an open transaction with its locks, for as long as it liked.
+SessionDep = Annotated[Session, Depends(get_session, scope="function")]
 
 bearer = HTTPBearer(
     auto_error=False,

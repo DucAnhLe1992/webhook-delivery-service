@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -371,3 +372,43 @@ def test_the_worker_does_not_start_without_webhook_secrets(monkeypatch):
 
     with pytest.raises(SystemExit, match="WEBHOOK_SECRETS is not set"):
         worker.main()
+
+
+def test_a_worker_that_meets_a_lock_while_saving_a_result_gives_up_and_carries_on(
+    client, db, short_limits_engine, caplog
+):
+    delivery_id = submit(client)
+    stuck = db.connect()
+    stop = threading.Event()
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        # While the worker sends, another transaction locks the delivery's row and keeps it.
+        stuck.execute(
+            text("SELECT 1 FROM deliveries WHERE id = :id FOR UPDATE"),
+            {"id": uuid.UUID(delivery_id)},
+        )
+        threading.Timer(1, stop.set).start()
+        return httpx2.Response(200)
+
+    safety_net = threading.Timer(10, stop.set)
+    safety_net.start()
+    started = time.monotonic()
+    try:
+        with httpx2.Client(transport=httpx2.MockTransport(answer)) as receiver:
+            run(
+                short_limits_engine,
+                receiver,
+                SETTINGS.model_copy(update={"poll_interval_seconds": 0.05}),
+                stop,
+            )
+    finally:
+        safety_net.cancel()
+        stuck.rollback()
+        stuck.close()
+
+    assert time.monotonic() - started < 5
+    assert "database error (canceling statement due to lock timeout)" in caplog.text
+    # The result was not saved, so the delivery keeps its claim and is sent again once the
+    # claim expires.
+    delivery = client.get(f"/deliveries/{delivery_id}").json()
+    assert (delivery["status"], delivery["attempt_count"]) == ("processing", 1)

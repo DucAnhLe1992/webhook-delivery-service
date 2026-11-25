@@ -1,6 +1,8 @@
 """Delivery worker: sends due deliveries to the receiver and records each result.
 
 Run it with `uv run webhook-worker`. Ctrl+C (or SIGTERM) stops it after the current delivery.
+It waits for the database at startup, and does not start if the database's schema is older
+than this code.
 """
 
 import logging
@@ -12,13 +14,13 @@ from datetime import timedelta
 
 import httpx2
 from sqlalchemy import Engine
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from webhook_service.config import Settings, get_settings
-from webhook_service.db import get_engine
+from webhook_service.db import describe_error, get_engine, storage_unavailable
 from webhook_service.domain import AttemptOutcome, AttemptResult, DeliveryStatus
 from webhook_service.retry import backoff_delay
+from webhook_service.schema import schema_problem
 from webhook_service.schemas import WebhookMessage
 from webhook_service.sender import send_webhook
 from webhook_service.services import delivery_service
@@ -97,17 +99,52 @@ def run(engine: Engine, client: httpx2.Client, settings: Settings, stop: threadi
     while not stop.is_set():
         try:
             worked = process_one(engine, client, settings)
-        except OperationalError:
-            log.warning("database unavailable, trying again in %ss", settings.poll_interval_seconds)
-            worked = False
-        except Exception:
-            # A bug must not stop every delivery. A delivery claimed before the error is sent
-            # again once its claim expires, and the attempt still counts towards the limit.
-            log.exception("unexpected error, trying again in %ss", settings.poll_interval_seconds)
+        except Exception as error:
+            if storage_unavailable(error):
+                # Unreachable, or a time limit ran out. A delivery claimed before the error is
+                # sent again once its claim expires.
+                log.warning(
+                    "database error (%s), trying again in %ss",
+                    describe_error(error),
+                    settings.poll_interval_seconds,
+                )
+            else:
+                # A bug must not stop every delivery. A delivery claimed before the error is
+                # sent again once its claim expires, and the attempt still counts.
+                log.exception(
+                    "unexpected error, trying again in %ss", settings.poll_interval_seconds
+                )
             worked = False
         if not worked:
             # Sleep until the next poll, but wake up at once when asked to stop.
             stop.wait(settings.poll_interval_seconds)
+
+
+def wait_for_database(engine: Engine, settings: Settings, stop: threading.Event) -> bool:
+    """Wait until the database answers, then exit unless its schema is recent enough.
+
+    Returns False if asked to stop while waiting. A database that is down at startup is waited
+    for, as it is later on. A schema that is behind is not: every claim would fail, so the worker
+    could only log the same error on every poll until someone ran the migrations.
+    """
+    while not stop.is_set():
+        try:
+            with engine.connect() as connection:
+                problem = schema_problem(connection)
+        except Exception as error:
+            if not storage_unavailable(error):
+                raise
+            log.warning(
+                "database error (%s), trying again in %ss",
+                describe_error(error),
+                settings.poll_interval_seconds,
+            )
+            stop.wait(settings.poll_interval_seconds)
+            continue
+        if problem is not None:
+            sys.exit(f"The worker cannot start: {problem}")
+        return True
+    return False
 
 
 def main() -> None:
@@ -138,8 +175,12 @@ def main() -> None:
         settings.receiver_url,
         len(settings.webhook_secrets),
     )
-    with httpx2.Client(timeout=settings.delivery_timeout_seconds, follow_redirects=False) as client:
-        run(get_engine(), client, settings, stop)
+    engine = get_engine()
+    if wait_for_database(engine, settings, stop):
+        with httpx2.Client(
+            timeout=settings.delivery_timeout_seconds, follow_redirects=False
+        ) as client:
+            run(engine, client, settings, stop)
     log.info("stopped")
 
 

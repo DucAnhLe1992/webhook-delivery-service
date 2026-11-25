@@ -5,7 +5,7 @@
 PostgreSQL must be running (docker compose up -d --wait). The demo uses its own database,
 webhooks_demo, with two producers, carrental and friendster. It starts the test receiver,
 the API and a worker on free ports, with a webhook secret made for the run. Short timeouts
-keep it to about half a minute. It plays five scenes:
+keep it to about half a minute. It plays six scenes:
 
 1. A request repeated with the same Idempotency-Key is stored once.
 2. While the receiver is down, the worker retries with growing waits.
@@ -13,6 +13,9 @@ keep it to about half a minute. It plays five scenes:
 4. A worker killed in the middle of a delivery is replaced, and the delivery is sent again.
 5. Only known producers may submit, each sees only its own deliveries, and the receiver
    refuses webhooks that were changed, forged or replayed.
+6. A request stuck behind a frozen transaction gives up quickly, and PostgreSQL ends the frozen
+   transaction. An API whose database is unreachable is alive but not ready, and a worker does
+   not start against a database without tables.
 """
 
 import os
@@ -32,12 +35,13 @@ from typing import Any
 import httpx2
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import URL, create_engine, make_url, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import URL, Connection, Engine, create_engine, make_url, text
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
 from webhook_service import signing
-from webhook_service.config import get_settings
+from webhook_service.config import Settings, get_settings
+from webhook_service.db import create_db_engine, describe_error
 from webhook_service.services import producer_service
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,7 +52,11 @@ SETTINGS = {
     "RETRY_BASE_DELAY_SECONDS": "2",
     "MAX_ATTEMPTS": "5",
     "POLL_INTERVAL_SECONDS": "0.2",
+    "DATABASE_LOCK_TIMEOUT_SECONDS": "1",
+    "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS": "3",
 }
+# Nothing listens on port 1, so connections to this database are refused at once.
+UNREACHABLE_DATABASE = "postgresql+psycopg://webhooks:webhooks@127.0.0.1:1/webhooks"
 SLOW_SECONDS = 3  # How long the receiver takes in slow mode: longer than the timeout.
 UUID = re.compile(r"\b([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 LOG_LINE = re.compile(r"^(\d\d:\d\d:\d\d) \[(?:worker|receiver)\] (.*)$")
@@ -149,6 +157,7 @@ def prepare_database() -> tuple[URL, dict[str, str]]:
 
 class Demo:
     def __init__(self, database_url: URL, api_keys: dict[str, str], log_dir: Path) -> None:
+        self.database_url, self.log_dir = database_url, log_dir
         receiver_port, api_port = free_port(), free_port()
         # The worker signs with this secret, and the receiver checks signatures with it.
         self.secret = signing.new_secret()
@@ -160,6 +169,7 @@ class Demo:
             "RECEIVER_URL": f"http://127.0.0.1:{receiver_port}/webhooks",
             "WEBHOOK_SECRETS": self.secret,
         }
+        self.env = env
         python = sys.executable
         self.receiver = Process(
             "receiver",
@@ -448,6 +458,111 @@ class Demo:
             "webhook-signature": signing.signature_header([guess], webhook_id, timestamp, body)
         }
 
+    def scene_6(self) -> None:
+        print("\nScene 6: every wait has a limit")
+        lock_timeout = SETTINGS["DATABASE_LOCK_TIMEOUT_SECONDS"]
+        idle_timeout = float(SETTINGS["DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS"])
+        say(
+            "A request froze in the middle of its transaction: it had stored Idempotency-Key "
+            "event-6, but not committed. Another request with that key must wait to learn "
+            f"whether it commits. It waits at most {lock_timeout} s, and PostgreSQL ends a "
+            f"transaction that sits idle for {idle_timeout:.0f} s."
+        )
+        engine, frozen = self.freeze_a_request("event-6")
+        frozen_at = time.monotonic()
+        stuck = self.submit("event-6", booking_id=6)
+        waited = time.monotonic() - frozen_at
+        self.note(
+            f"{'POST, Idempotency-Key event-6':<44}-> {stuck.status_code} after {waited:.1f} s"
+        )
+        ready = self.api_client.get("/ready")
+        self.note(f"{'GET /ready':<44}-> {ready.status_code} {ready.json()['status']}")
+        time.sleep(max(0.0, idle_timeout + 0.5 - (time.monotonic() - frozen_at)))
+        try:
+            frozen.execute(text("SELECT 1"))
+            ended = "nothing: its transaction is still open"
+        except DBAPIError as error:
+            ended = describe_error(error)
+        finally:
+            frozen.close()
+            engine.dispose()
+        say(
+            "The request gave up instead of waiting as long as the frozen one, and the API "
+            "stayed ready: one stuck transaction is not an outage. PostgreSQL then ended the "
+            "frozen transaction, which frees the key. When the frozen request wakes up, it finds:"
+        )
+        print(f"    {ended}")
+        again = self.submit("event-6", booking_id=6)
+        delivery_id = again.json()["delivery_id"]
+        self.note(
+            f"{'POST, Idempotency-Key event-6 again':<44}-> {again.status_code}, "
+            f"{short(delivery_id)}, not a replay"
+        )
+        self.wait_until_delivered(delivery_id)
+
+        say(
+            "Liveness and readiness are different questions. A second API whose database "
+            "cannot be reached is alive, so restarting it would not help. It is not ready, so "
+            "traffic should go to other instances."
+        )
+        api_port = free_port()
+        api_2 = Process(
+            "api-2",
+            [sys.executable, "-m", "uvicorn", "webhook_service.main:app", "--port", str(api_port)],
+            self.env | {"DATABASE_URL": UNREACHABLE_DATABASE},
+            self.log_dir,
+        )
+        api_2.start()
+        with httpx2.Client(base_url=f"http://127.0.0.1:{api_port}", timeout=5) as client:
+            try:
+                self.wait_until("the second API is up", lambda: client.get("/health"))
+                live, ready = client.get("/health"), client.get("/ready")
+            finally:
+                api_2.stop()
+        self.note(f"{'Second API, GET /health':<30}-> {live.status_code} {live.json()['status']}")
+        readiness = ready.json()
+        self.note(
+            f"{'Second API, GET /ready':<30}-> {ready.status_code} {readiness['status']}: "
+            f"{readiness['detail']}"
+        )
+
+        say(
+            "A worker pointed at a database without tables does not start, where it used to "
+            "log the same error on every poll:"
+        )
+        database_without_tables = self.database_url.set(database="postgres")
+        worker_3 = Process(
+            "worker-3",
+            [sys.executable, "-m", "webhook_service.worker.main"],
+            self.env | {"DATABASE_URL": database_without_tables.render_as_string(False)},
+            self.log_dir,
+        )
+        worker_3.start()
+        assert worker_3.popen is not None
+        exit_code = worker_3.popen.wait(timeout=30)
+        last_line = worker_3.log_path.read_text().strip().splitlines()[-1]
+        print(f"    worker-3 exits with code {exit_code}: {last_line}")
+
+    def freeze_a_request(self, key: str) -> tuple[Engine, Connection]:
+        """Store a delivery with the key and leave its transaction open, as a frozen request.
+
+        It uses the API's own database settings, so its session has the same limits.
+        """
+        settings = Settings(
+            _env_file=None, **{name.lower(): value for name, value in SETTINGS.items()}
+        )
+        engine = create_db_engine(self.database_url, settings)
+        connection = engine.connect()
+        connection.execute(
+            text(
+                "INSERT INTO deliveries (id, producer_id, event_type, payload, idempotency_key)"
+                " SELECT gen_random_uuid(), id, 'booking.confirmed', '{}', :key"
+                " FROM producers WHERE name = 'carrental'"
+            ),
+            {"key": key},
+        )
+        return engine, connection
+
     def stop(self) -> None:
         print("\nStopping the processes.")
         for process in reversed(self.processes):
@@ -478,6 +593,7 @@ def main() -> None:
         demo.scene_3()
         demo.scene_4()
         demo.scene_5()
+        demo.scene_6()
         failed = False
     except DemoError as error:
         print(f"\n{error} The process logs are in {log_dir}.")

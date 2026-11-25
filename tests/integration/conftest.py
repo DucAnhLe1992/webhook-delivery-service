@@ -11,8 +11,8 @@ from sqlalchemy import URL, Engine, create_engine, make_url, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from webhook_service.config import get_settings
-from webhook_service.db import get_session
+from webhook_service.config import Settings, get_settings
+from webhook_service.db import create_db_engine, get_session
 from webhook_service.main import app
 from webhook_service.services import producer_service
 
@@ -22,6 +22,14 @@ TEST_DATABASE_URL = make_url(
         "TEST_DATABASE_URL",
         "postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks_test",
     )
+)
+# Short limits, for tests that run into them on purpose.
+SHORT_LIMITS = Settings(
+    _env_file=None,
+    database_pool_timeout_seconds=0.2,
+    database_statement_timeout_seconds=0.5,
+    database_lock_timeout_seconds=0.2,
+    database_idle_in_transaction_timeout_seconds=0.3,
 )
 
 
@@ -57,7 +65,7 @@ def create_database_if_missing(url: URL) -> None:
 
 @pytest.fixture(scope="session")
 def engine() -> Iterator[Engine]:
-    """The test database, migrated to the latest schema with the real Alembic migrations."""
+    """The test database, migrated with the real migrations, with the service's own limits."""
     refuse_unless_disposable(TEST_DATABASE_URL)
     try:
         create_database_if_missing(TEST_DATABASE_URL)
@@ -71,7 +79,15 @@ def engine() -> Iterator[Engine]:
     config.attributes["database_url"] = TEST_DATABASE_URL
     command.upgrade(config, "head")
 
-    engine = create_engine(TEST_DATABASE_URL)
+    engine = create_db_engine(TEST_DATABASE_URL, Settings(_env_file=None))
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture
+def short_limits_engine(db: Engine) -> Iterator[Engine]:
+    """The emptied test database, with every database limit cut to a fraction of a second."""
+    engine = create_db_engine(TEST_DATABASE_URL, SHORT_LIMITS)
     yield engine
     engine.dispose()
 

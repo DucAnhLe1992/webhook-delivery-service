@@ -28,8 +28,8 @@ router = APIRouter(
             "description": "The request body is larger than MAX_EVENT_BYTES"
         },
         status.HTTP_503_SERVICE_UNAVAILABLE: {
-            "description": "Storage is unavailable, so it is not known whether the delivery "
-            "was stored. Retry with the same Idempotency-Key."
+            "description": "Storage is unavailable or too busy, so it is not known whether the "
+            "delivery was stored. Retry with the same Idempotency-Key."
         },
     },
 )
@@ -69,7 +69,7 @@ def submit_delivery(
     "/{delivery_id}",
     responses={
         status.HTTP_404_NOT_FOUND: {"description": "This producer has no delivery with this ID"},
-        status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Storage is unavailable"},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Storage is unavailable or too busy"},
     },
 )
 def read_delivery(

@@ -25,6 +25,20 @@ class Settings(BaseSettings):
     database_url: PostgresDsn = PostgresDsn(
         "postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks"
     )
+    # Every wait on the database has a limit, so that a stuck lock, a slow statement or a busy
+    # pool becomes a quick error that can be retried, instead of requests and workers piling up.
+    # How long opening a connection may take. The driver waits at least 2 seconds.
+    database_connect_timeout_seconds: PositiveInt = 5
+    # How long a request waits for a free connection from the pool.
+    database_pool_timeout_seconds: PositiveFloat = 2.0
+    # How long one statement may run, waiting for locks included.
+    database_statement_timeout_seconds: PositiveFloat = 5.0
+    # How long a statement may wait for a lock that another transaction holds. Migrations wait
+    # no longer either: a migration waiting for a lock holds up every later query on the table.
+    database_lock_timeout_seconds: PositiveFloat = 2.0
+    # How long a transaction may sit idle between statements. PostgreSQL then ends the session
+    # and releases its locks, so a process that freezes mid-transaction cannot block the others.
+    database_idle_in_transaction_timeout_seconds: PositiveFloat = 10.0
 
     # API: the largest request body it reads, in bytes, which limits the size of an event.
     max_event_bytes: PositiveInt = 65536
@@ -50,6 +64,17 @@ class Settings(BaseSettings):
     # dead and another worker sends the delivery again.
     claim_timeout_seconds: PositiveFloat = 60.0
     poll_interval_seconds: PositiveFloat = 1.0
+
+    @model_validator(mode="after")
+    def lock_timeout_is_shorter(self) -> Self:
+        # Waiting for a lock counts towards the statement timeout, so a lock timeout that is not
+        # shorter would never be reached.
+        if self.database_lock_timeout_seconds >= self.database_statement_timeout_seconds:
+            raise ValueError(
+                "DATABASE_LOCK_TIMEOUT_SECONDS must be shorter than "
+                "DATABASE_STATEMENT_TIMEOUT_SECONDS, or it would never be reached"
+            )
+        return self
 
     @field_validator("webhook_secrets", mode="before")
     @classmethod

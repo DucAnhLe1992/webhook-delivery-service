@@ -1,6 +1,6 @@
 [project]
 name = "webhook-delivery-service"
-version = "0.5.1"
+version = "0.5.2"
 description = "Accepts events from producer apps and delivers them as webhooks to a configured receiver."
 readme = "README.md"
 authors = [

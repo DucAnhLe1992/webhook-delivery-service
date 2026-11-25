@@ -43,6 +43,15 @@ error.
   JavaScript libraries.
 - **Bounded input, quiet secrets.** Bodies over `MAX_EVENT_BYTES` get `413` before they are read
   into memory, and an invalid setting stops the processes at startup without printing secrets.
+- **Every wait has a limit.** Connections, pooled connections, statements, lock waits and idle
+  transactions are all bounded, and TCP keepalives catch a dead network in about 25 seconds
+  instead of hours. A stuck lock gives a `503` in two seconds instead of a pile-up, and migrations
+  give up on a lock rather than queue every query behind them. Tests run into each limit on
+  purpose, and probes against a stopped, paused and disconnected database measured the rest.
+- **Liveness apart from readiness.** `/health` never touches the database, so an outage does not
+  get the API restarted for nothing, while `/ready` checks the database and its schema revision.
+  A worker waits for a database that is down, and refuses to start against one whose migrations
+  have not run.
 
 ## How it works
 
@@ -106,14 +115,16 @@ location: /deliveries/73731487-6839-4966-b9b2-9b2a1a83054c
 
 Then follow it with `curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8000/deliveries/<delivery_id>`,
 which shows its status and every attempt. The test receiver logs each webhook after checking its
-signature. Interactive API docs are at http://127.0.0.1:8000/docs.
+signature. `curl http://127.0.0.1:8000/ready` tells whether the API can serve requests, and
+interactive API docs are at http://127.0.0.1:8000/docs.
 
 ### See the guarantees in action
 
 `uv run python dev/demo.py` starts its own receiver, API and worker against a separate
-`webhooks_demo` database and plays five scenes in about 20 seconds: a repeated request, a receiver
-that is down, an answer that comes too late, a worker killed in the middle of a delivery, and two
-producers and an attacker testing the trust checks. Two of them, shortened:
+`webhooks_demo` database and plays six scenes in about 25 seconds: a repeated request, a receiver
+that is down, an answer that comes too late, a worker killed in the middle of a delivery, two
+producers and an attacker testing the trust checks, and a frozen transaction meeting the limits.
+Three of them, shortened:
 
 ```text
 Scene 4: a worker dies in the middle of a delivery
@@ -140,6 +151,17 @@ Scene 5: who may submit, who may read, and who sent a webhook
   Attacker changes booking_id in the body     -> 401
   Attacker gives it a new timestamp           -> 401
   Attacker signs it with a guessed secret     -> 401
+
+Scene 6: every wait has a limit
+  POST, Idempotency-Key event-6               -> 503 after 1.0 s
+  GET /ready                                  -> 200 ready
+  ...
+    terminating connection due to idle-in-transaction timeout
+  POST, Idempotency-Key event-6 again         -> 202, 1d0e3fbf, not a replay
+  ...
+  Second API, GET /health       -> 200 ok
+  Second API, GET /ready        -> 503 not ready: the database is unavailable or too busy
+    worker-3 exits with code 1: The worker cannot start: the database has no tables yet. Run `uv run alembic upgrade head`.
 ```
 
 ## API
@@ -148,9 +170,10 @@ Both `/deliveries` endpoints need the producer's API key, as `Authorization: Bea
 
 | Request | Answers |
 |---|---|
-| `POST /deliveries` | `202` stored (or replayed, with `Idempotent-Replayed: true`), `401` missing or invalid API key, `409` key reused for different content, `413` body larger than `MAX_EVENT_BYTES`, `422` invalid request, `503` storage unavailable, so whether it was stored is unknown: retry with the same key |
-| `GET /deliveries/{id}` | `200` with the status and every attempt, `401` missing or invalid API key, `404` unknown ID or another producer's delivery, `422` malformed ID, `503` storage unavailable |
-| `GET /health` | `200` while the API process is up |
+| `POST /deliveries` | `202` stored (or replayed, with `Idempotent-Replayed: true`), `401` missing or invalid API key, `409` key reused for different content, `413` body larger than `MAX_EVENT_BYTES`, `422` invalid request, `503` storage unavailable or too busy, so whether it was stored is unknown: retry with the same key |
+| `GET /deliveries/{id}` | `200` with the status and every attempt, `401` missing or invalid API key, `404` unknown ID or another producer's delivery, `422` malformed ID, `503` storage unavailable or too busy |
+| `GET /health` | Liveness: `200` while the API process is up. It does not use the database. |
+| `GET /ready` | Readiness: `200` when the database can be reached and its schema is recent enough, `503` with the reason otherwise |
 
 The receiver gets one `POST` per attempt:
 
@@ -200,10 +223,14 @@ how receivers should answer and drop duplicates.
    changed and replayed ones.
 8. **Isolation:** a producer can read only its own deliveries, and its idempotency keys cannot
    collide with another producer's.
+9. **Bounded waits:** every wait on the database has a limit, and running out of one gives a
+   `503` or a retry, never a hang. The one exception, a query already sent to a database that
+   freezes while its network keeps answering, is documented.
 
 How each failure is handled, from a crashed API to a frozen worker, is listed in
 [ARCHITECTURE.md](ARCHITECTURE.md#guarantees-and-failure-modes), and what the security model does
-and does not cover in [its security section](ARCHITECTURE.md#security-model).
+and does not cover in [its security section](ARCHITECTURE.md#security-model). Every wait and its
+limit are in [Bounded waits](ARCHITECTURE.md#bounded-waits).
 
 ## Configuration
 
@@ -212,6 +239,11 @@ Set environment variables, or copy `.env.example` to `.env`.
 | Variable | Default | Meaning |
 |---|---|---|
 | `DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks` | Used by the API, the worker, migrations and `webhook-admin`. |
+| `DATABASE_CONNECT_TIMEOUT_SECONDS` | `5` | How long opening a database connection may take. |
+| `DATABASE_POOL_TIMEOUT_SECONDS` | `2` | How long a request waits for a free pooled connection before `503`. |
+| `DATABASE_STATEMENT_TIMEOUT_SECONDS` | `5` | How long one statement may run, lock waits included. |
+| `DATABASE_LOCK_TIMEOUT_SECONDS` | `2` | How long a statement, or a migration, may wait for a lock. Shorter than the statement timeout. |
+| `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` | `10` | How long a transaction may sit idle before PostgreSQL ends it and releases its locks. |
 | `MAX_EVENT_BYTES` | `65536` | The largest request body the API reads. A larger one gets `413`. |
 | `WEBHOOK_SECRETS` | none | Secrets to sign webhooks with, separated by spaces (two during a rotation). `uv run webhook-admin new-webhook-secret` makes one. The worker does not start without one. |
 | `RECEIVER_URL` | `http://127.0.0.1:9000/webhooks` | The only destination. Producers cannot choose a URL. Deliveries waiting for a retry go to the current value, so every worker needs the same one. |
@@ -230,11 +262,11 @@ uv run pytest              # all tests; integration tests need PostgreSQL
 uv run pytest tests/unit   # only the tests that need no database
 uv run ruff check .        # lint
 uv run ruff format .       # format
-uv run python dev/demo.py  # the five scenes, with real processes
+uv run python dev/demo.py  # the six scenes, with real processes
 ```
 
-Integration tests create a `webhooks_test` database on the same server and run the real
-migrations on it. Set `TEST_DATABASE_URL` to use another one. The tests delete all data in it, so
+Integration tests create a `webhooks_test` database on the same server, run the real
+migrations on it, and connect with the service's own database limits. Set `TEST_DATABASE_URL` to use another one. The tests delete all data in it, so
 they refuse a database whose name does not end in `_test`, or the one `DATABASE_URL` names.
 The sender's tests run a real HTTP server on a local port, to check timeouts, dropped connections
 and slow, huge or corrupt response bodies.
@@ -256,7 +288,8 @@ service.
 src/webhook_service/
   main.py                       API app, settings check at startup, 503 when storage is down
   config.py                     settings from the environment, never echoed in errors
-  db.py                         database engine and per-request session
+  db.py                         database engine with a limit on every wait, sessions
+  schema.py                     the schema revision the code needs, and the check for it
   domain.py                     delivery states and attempt outcomes, shared by every layer
   models.py                     producers, api_keys, deliveries and delivery_attempts tables
   schemas.py                    request, response and webhook message models
@@ -265,7 +298,8 @@ src/webhook_service/
   api/dependencies.py           the database session and the producer behind the API key
   api/body_limit.py             413 for bodies over MAX_EVENT_BYTES, before they are read
   api/deliveries.py             POST and GET /deliveries, scoped to the producer
-  worker/main.py                the worker loop: claim, send, record
+  api/health.py                 /health for liveness and /ready for readiness
+  worker/main.py                the worker loop: wait for the database, then claim, send, record
   sender.py                     signs and sends one attempt, classifies it by status code
   signing.py                    Standard Webhooks signatures: sign, verify, secrets
   retry.py                      growing, capped, randomized retry delays
@@ -283,12 +317,12 @@ docs/                           user manual and build history
 | Document | What it covers |
 |---|---|
 | [User manual](docs/USER_MANUAL.md) | Running the service, submitting and tracking events, receiving webhooks, how a delivery flows step by step, configuration, operating and troubleshooting. |
-| [Architecture](ARCHITECTURE.md) | Components, data model, state machine, sequence diagrams, locking, retry policy, security model, failure modes and design decisions. |
+| [Architecture](ARCHITECTURE.md) | Components, data model, state machine, sequence diagrams, locking, retry policy, bounded waits, security model, failure modes and design decisions. |
 | [How it was built](docs/MILESTONES.md) | The milestones, the experiments that motivated each one, and what they taught. |
 
 ## Status
 
-Milestones 1 to 5.1 are done, and each is tagged (`milestone-1` to `milestone-5.1`).
+Milestones 1 to 5.2 are done, and each is tagged (`milestone-1` to `milestone-5.2`).
 
 - [x] **1. Send it now.** Direct delivery during the request, to learn what can go wrong.
 - [x] **2. Store before acknowledging.** `202` only after commit, `503` otherwise.
@@ -301,13 +335,15 @@ Milestones 1 to 5.1 are done, and each is tagged (`milestone-1` to `milestone-5.
 - [x] **5.1. Trust.** Producers with hashed, revocable API keys; deliveries and idempotency keys
   scoped per producer; an event size limit; Standard Webhooks signatures with secret rotation;
   signature checks in the test receiver; settings that never print secrets.
-- [ ] **5.2. Bounded waits.** Statement and lock timeouts, a short wait for a pooled connection, a
-  readiness check, and a worker that checks the schema at startup.
+- [x] **5.2. Bounded waits.** A limit on every database wait, including migrations' lock waits; a
+  session that closes before the response is sent; TCP keepalives; `/ready` next to `/health`;
+  and a worker that waits for the database and checks its schema at startup.
 - [ ] **5.3. Observability and operations.** Structured logs, metrics, a replay endpoint and a
   retention job.
 - [ ] **5.4. Deployment.** Container images, migrations as a deploy step, a shutdown grace period,
-  backups and a runbook.
+  a limit on concurrent requests, backups and a runbook.
 
 Known limitations: one receiver with one set of secrets, no rate limits, API keys and idempotency
-keys that never expire, old rows kept forever, no hard deadline for a whole attempt, and no
-ordering guarantee. Destinations chosen by producers and a dashboard are not planned.
+keys that never expire, old rows kept forever, no hard deadline for a whole attempt, no limit yet
+on a query already sent to a frozen database, and no ordering guarantee. Destinations chosen by
+producers and a dashboard are not planned.
