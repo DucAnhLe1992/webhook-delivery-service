@@ -1,10 +1,12 @@
 import hashlib
 import json
 import uuid
-from datetime import timedelta
+from collections.abc import Callable, Collection
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, selectinload
 
@@ -14,6 +16,25 @@ from webhook_service.models import Delivery, DeliveryAttempt
 
 class IdempotencyKeyReused(Exception):
     """The Idempotency-Key was already used for a request with different content."""
+
+
+@dataclass(frozen=True)
+class ExpiredClaim:
+    """An attempt whose worker stopped before saving a result, found by another worker."""
+
+    delivery_id: uuid.UUID
+    attempt: int
+    # No attempts were left, so the delivery failed instead of being sent again.
+    delivery_failed: bool
+
+
+@dataclass(frozen=True)
+class QueueSnapshot:
+    """How much work is waiting, for metrics."""
+
+    due: int
+    oldest_due_seconds: float
+    by_status: dict[DeliveryStatus, int]
 
 
 def request_fingerprint(event_type: str, data: dict[str, Any]) -> str:
@@ -85,13 +106,17 @@ def get_delivery(
 
 
 def claim_next_due(
-    session: Session, *, claim_timeout: timedelta, max_attempts: int
+    session: Session,
+    *,
+    claim_timeout: timedelta,
+    max_attempts: int,
+    on_expired_claim: Callable[[ExpiredClaim], None] | None = None,
 ) -> Delivery | None:
     """Claim the next due delivery for one attempt, or return None if nothing is due.
 
     A delivery is due when it is pending and its next_attempt_at has passed, or when it is
     processing but its claim expired: the worker that held it stopped or hung before
-    saving a result.
+    saving a result. on_expired_claim hears about each expired claim, once it is committed.
 
     FOR UPDATE SKIP LOCKED lets several workers claim at the same time: a row that another
     worker is claiming right now is skipped instead of waited for.
@@ -110,15 +135,19 @@ def claim_next_due(
         if delivery is None:
             return None
 
+        expired = None
         if delivery.status == DeliveryStatus.PROCESSING:
             close_expired_attempt(session, delivery.claim_token)
-            if delivery.attempt_count >= max_attempts:
+            if delivery.attempt_count - delivery.attempt_base >= max_attempts:
                 # Attempts are counted when claimed, not when their result is saved, so a
                 # delivery that crashes every worker that sends it still runs out of attempts.
                 delivery.status = DeliveryStatus.FAILED
                 delivery.claim_token = None
                 session.commit()
+                if on_expired_claim:
+                    on_expired_claim(ExpiredClaim(delivery.id, delivery.attempt_count, True))
                 continue
+            expired = ExpiredClaim(delivery.id, delivery.attempt_count, False)
 
         attempt = DeliveryAttempt(
             id=uuid.uuid4(), delivery_id=delivery.id, number=delivery.attempt_count + 1
@@ -129,6 +158,8 @@ def claim_next_due(
         delivery.attempt_count = attempt.number
         delivery.next_attempt_at = func.now() + claim_timeout
         session.commit()
+        if expired and on_expired_claim:
+            on_expired_claim(expired)
         return delivery
 
 
@@ -180,7 +211,8 @@ def record_attempt(
     if result.outcome is AttemptOutcome.DELIVERED:
         delivery.status = DeliveryStatus.DELIVERED
     elif (
-        result.outcome is AttemptOutcome.RETRYABLE_FAILURE and delivery.attempt_count < max_attempts
+        result.outcome is AttemptOutcome.RETRYABLE_FAILURE
+        and delivery.attempt_count - delivery.attempt_base < max_attempts
     ):
         delivery.status = DeliveryStatus.PENDING
         delivery.next_attempt_at = func.now() + retry_delay
@@ -191,3 +223,103 @@ def record_attempt(
     delivery.last_error_category = result.error_category
     session.commit()
     return DeliveryStatus(delivery.status)
+
+
+def replay_failed(
+    session: Session,
+    *,
+    delivery_ids: Collection[uuid.UUID] = (),
+    failed_since: datetime | None = None,
+    producer_id: uuid.UUID | None = None,
+) -> list[uuid.UUID]:
+    """Queue failed deliveries again, and return the IDs of those that were.
+
+    Choose them by ID, or by when they failed. Each gets MAX_ATTEMPTS attempts again, so a
+    receiver that is still unsteady after an outage has the whole retry schedule to recover.
+    It keeps its webhook-id and its history; the new attempts are numbered on from the old.
+    Deliveries that are not failed are left alone.
+    """
+    if not delivery_ids and failed_since is None:
+        raise ValueError("choose deliveries by ID or by when they failed")
+    statement = update(Delivery).where(Delivery.status == DeliveryStatus.FAILED)
+    if delivery_ids:
+        statement = statement.where(Delivery.id.in_(delivery_ids))
+    if failed_since is not None:
+        statement = statement.where(Delivery.updated_at >= failed_since)
+    if producer_id is not None:
+        statement = statement.where(Delivery.producer_id == producer_id)
+    replayed = session.scalars(
+        statement.values(
+            status=DeliveryStatus.PENDING,
+            next_attempt_at=func.now(),
+            attempt_base=Delivery.attempt_count,
+        )
+        .returning(Delivery.id)
+        .execution_options(synchronize_session=False)
+    ).all()
+    session.commit()
+    return list(replayed)
+
+
+def finished_before(older_than: timedelta):
+    """Deliveries that were delivered or failed, and have not changed for `older_than`."""
+    return select(Delivery.id).where(
+        Delivery.status.in_([DeliveryStatus.DELIVERED, DeliveryStatus.FAILED]),
+        Delivery.updated_at < func.now() - older_than,
+    )
+
+
+def count_finished_before(session: Session, older_than: timedelta) -> int:
+    return session.scalar(select(func.count()).select_from(finished_before(older_than).subquery()))
+
+
+def purge_finished(session: Session, *, older_than: timedelta, batch_size: int = 1000) -> int:
+    """Delete deliveries that finished more than `older_than` ago, with their attempts.
+
+    Pending and processing deliveries are never deleted. The deletes run in batches, each in a
+    short transaction of its own, so a large purge never holds many locks for long. A delivery
+    that is being replayed at that moment is skipped.
+    """
+    deleted = 0
+    while True:
+        batch = finished_before(older_than).limit(batch_size).with_for_update(skip_locked=True)
+        count = session.execute(
+            delete(Delivery)
+            .where(Delivery.id.in_(batch.scalar_subquery()))
+            .execution_options(synchronize_session=False)
+        )
+        session.commit()
+        deleted += count.rowcount
+        if count.rowcount < batch_size:
+            return deleted
+
+
+def queue_snapshot(session: Session) -> QueueSnapshot:
+    """What is waiting: deliveries due now, how long the oldest has waited, and status counts.
+
+    Both are served by partial indexes: the first reads only unfinished deliveries, through
+    ix_deliveries_due, and the count of failed ones uses ix_deliveries_finished.
+    """
+    due = Delivery.next_attempt_at <= func.now()
+    unfinished = session.execute(
+        select(
+            func.count().filter(due),
+            func.coalesce(
+                func.extract("epoch", func.now() - func.min(Delivery.next_attempt_at).filter(due)),
+                0,
+            ),
+            func.count().filter(Delivery.status == DeliveryStatus.PENDING),
+            func.count().filter(Delivery.status == DeliveryStatus.PROCESSING),
+        ).where(Delivery.status.in_([DeliveryStatus.PENDING, DeliveryStatus.PROCESSING]))
+    ).one()
+    failed = session.scalar(select(func.count()).where(Delivery.status == DeliveryStatus.FAILED))
+    session.commit()
+    return QueueSnapshot(
+        due=unfinished[0],
+        oldest_due_seconds=float(unfinished[1]),
+        by_status={
+            DeliveryStatus.PENDING: unfinished[2],
+            DeliveryStatus.PROCESSING: unfinished[3],
+            DeliveryStatus.FAILED: failed,
+        },
+    )

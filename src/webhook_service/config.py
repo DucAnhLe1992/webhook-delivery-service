@@ -1,7 +1,8 @@
 from functools import lru_cache
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import (
+    Field,
     HttpUrl,
     PositiveFloat,
     PositiveInt,
@@ -64,6 +65,18 @@ class Settings(BaseSettings):
     # dead and another worker sends the delivery again.
     claim_timeout_seconds: PositiveFloat = 60.0
     poll_interval_seconds: PositiveFloat = 1.0
+
+    # Logs: "text" lines for people, or "json", one object per line, for a log collector.
+    log_format: Literal["text", "json"] = "text"
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    # Metrics, in the Prometheus format, each process on a port of its own. They show every
+    # producer's numbers, so they are never served on the API's port. 0 turns them off.
+    metrics_host: str = "127.0.0.1"
+    api_metrics_port: int = Field(default=8001, ge=0, le=65535)
+    worker_metrics_port: int = Field(default=8002, ge=0, le=65535)
+    # How long `webhook-admin purge` keeps a delivery after it was delivered or failed. Keep it
+    # longer than producers may retry a request: deleting a delivery frees its Idempotency-Key.
+    retention_days: PositiveInt = 30
 
     @model_validator(mode="after")
     def lock_timeout_is_shorter(self) -> Self:

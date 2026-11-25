@@ -13,7 +13,8 @@ Who should read what:
 | Building a receiver, an app that gets webhooks | [Receiving webhooks](#5-receiving-webhooks) |
 | Curious how it all fits together | [How a delivery flows](#6-how-a-delivery-flows) |
 | Managing producers, API keys and secrets | [Producers and API keys](#producers-and-api-keys), [Rotating the webhook secret](#rotating-the-webhook-secret) |
-| Keeping it healthy | [Operating the service](#8-operating-the-service), starting with [Health and readiness](#health-and-readiness) |
+| Keeping it healthy | [Operating the service](#8-operating-the-service): [Health and readiness](#health-and-readiness), [Logs](#logs), [Metrics](#metrics) and [Alerts](#alerts) |
+| Repairing what failed | [Replaying failed deliveries](#replaying-failed-deliveries), [Data retention](#data-retention), [Troubleshooting](#troubleshooting) |
 
 ## Contents
 
@@ -42,7 +43,7 @@ webhook), keeps trying when the receiver is down, and records every attempt.
 | **Webhook secret** | A secret the workers and the receiver share. Workers sign every webhook with it, and the receiver checks the signature. |
 | **Delivery** | One accepted event and its delivery state. Its ID is sent to the receiver as `webhook-id`. |
 | **Attempt** | One try at sending a delivery. It is recorded when a worker claims the delivery, so an attempt cut short by a crash may never have reached the receiver. A delivery can have several. |
-| **API** | The process that accepts and reports deliveries (`uvicorn webhook_service.main:app`). |
+| **API** | The process that accepts and reports deliveries (`webhook-api`). |
 | **Worker** | A process that sends deliveries (`webhook-worker`). You can run several. |
 | **Claim** | A worker's temporary ownership of a delivery while it sends it. Claims expire. |
 
@@ -53,7 +54,10 @@ A delivery is always in one of four states:
 | `pending` | Stored and waiting to be sent, either for the first time or for a retry. |
 | `processing` | A worker has claimed it and is sending it now. |
 | `delivered` | The receiver answered with a 2xx status. Final. |
-| `failed` | The receiver rejected it permanently, or every allowed attempt failed. Final. |
+| `failed` | The receiver rejected it permanently, or every allowed attempt failed. Final, unless an operator [replays](#replaying-failed-deliveries) it. |
+
+Delivered and failed deliveries are kept, with their history, until `webhook-admin purge` deletes
+them, `RETENTION_DAYS` after they finished.
 
 What the service promises, in plain words:
 
@@ -73,6 +77,8 @@ What the service promises, in plain words:
 - **Sending the same request twice is safe** if the producer includes an `Idempotency-Key` header.
 - **Nothing waits without a limit.** When the database is slow, stuck or gone, a request gets `503`
   within seconds, and a worker logs the problem and tries again, instead of hanging.
+- **What happens can be seen.** Each process logs one line per request or attempt, as text or
+  JSON, and serves Prometheus metrics, including how long the oldest due delivery has waited.
 - **Events can arrive out of order.**
 
 ## 2. Running the service
@@ -109,27 +115,34 @@ covers the rest.
 Use one terminal per process:
 
 ```bash
-uv run python dev/receiver.py                      # a test receiver on :9000
-uv run uvicorn webhook_service.main:app --reload   # the API on :8000
-uv run webhook-worker                              # a worker
+uv run python dev/receiver.py   # a test receiver on :9000
+uv run webhook-api --reload     # the API on :8000, its metrics on :8001
+uv run webhook-worker           # a worker, its metrics on :8002
 ```
 
-The API shows one access-log line per request:
+`webhook-api` runs Uvicorn with the service's own logging. `uvicorn webhook_service.main:app`
+works too, but then Uvicorn writes its first few lines in its own format.
+
+The API logs a line for each stored delivery, and one for each request, naming the producer if
+its API key was valid:
 
 ```text
-INFO:     127.0.0.1:54630 - "POST /deliveries HTTP/1.1" 202 Accepted
+22:18:03 [api] stored delivery 73731487-6839-4966-b9b2-9b2a1a83054c, booking.confirmed from carrental
+22:18:03 [api] POST /deliveries 202 (30 ms, carrental)
 ```
 
-The worker shows one line per attempt, starting with the delivery ID and the attempt number. Here
+The worker logs one line per attempt, starting with the delivery ID and the attempt number. Here
 the receiver answered `500` to the first attempt and `200` to the retry 11 seconds later:
 
 ```text
+01:28:38 [worker] metrics on http://127.0.0.1:8002/metrics
 01:28:38 [worker] started (pid 186013), sending to http://127.0.0.1:9000/webhooks, signing with 1 secret(s)
 01:28:50 [worker] 73731487-6839-4966-b9b2-9b2a1a83054c attempt 1: failed (HTTP 500), retrying in 10s
 01:29:01 [worker] 73731487-6839-4966-b9b2-9b2a1a83054c attempt 2: delivered (HTTP 200, 2 ms)
 ```
 
-Times are in the machine's local time. Other worker messages:
+Times are in the machine's local time. With `LOG_FORMAT=json`, every line is a JSON object with
+the same message, and fields to search by; see [Logs](#logs). Other worker messages:
 
 | Message | Meaning |
 |---|---|
@@ -138,10 +151,15 @@ Times are in the machine's local time. Other worker messages:
 | `failed (timeout), retrying in 9s` | No answer in time; the receiver may still have processed it. |
 | `failed (connection_error), retrying in 10s` | The receiver could not be reached. |
 | `result discarded; the claim expired and another worker took the delivery over` | This worker was so slow that its claim expired and another worker took over, so its result was not saved. |
-| `database error (connection failed: …), trying again in 1.0s` | PostgreSQL cannot be reached; the worker keeps polling. At startup it waits like this until the database is up. |
-| `database error (canceling statement due to lock timeout), trying again in 1.0s` | Another transaction held a lock the worker needed for longer than `DATABASE_LOCK_TIMEOUT_SECONDS`. See [Troubleshooting](#troubleshooting). |
-| `database error (canceling statement due to statement timeout), trying again in 1.0s` | A statement took longer than `DATABASE_STATEMENT_TIMEOUT_SECONDS`, usually because the database is overloaded. |
+| `attempt 1: the claim expired without a result, so the delivery is sent again` | The worker that made attempt 1 stopped or froze before saving a result, and this worker takes the delivery over. |
+| `attempt 8: the claim expired without a result, and no attempts are left: failed` | As above, but it was the last allowed attempt, so the delivery is now `failed`. |
+| `database error (connection failed: …), trying again every 1.0s` | PostgreSQL cannot be reached; the worker keeps polling. At startup it waits like this until the database is up. |
+| `database error (canceling statement due to lock timeout), trying again every 1.0s` | Another transaction held a lock the worker needed for longer than `DATABASE_LOCK_TIMEOUT_SECONDS`. See [Troubleshooting](#troubleshooting). |
+| `database error (canceling statement due to statement timeout), trying again every 1.0s` | A statement took longer than `DATABASE_STATEMENT_TIMEOUT_SECONDS`, usually because the database is overloaded. |
+| `database errors for 60s, the latest: …` | The errors go on. The worker logs the first one, then this reminder once a minute rather than a line per poll; `webhooks_worker_errors_total` counts every one. |
+| `database working again after 75s` | The errors have stopped. |
 | `unexpected error, trying again in 1.0s`, with a traceback | A bug. The worker carries on with other deliveries; the one it held is sent again when its claim expires. |
+| `metrics are off: cannot listen on 127.0.0.1:8002 (Address already in use). Set WORKER_METRICS_PORT to a free port, or to 0.` | Another process has the port, often a second worker on the same machine. This worker sends webhooks anyway, without metrics. |
 | `stopping after the current delivery`, then `stopped` | A clean stop after Ctrl+C or `SIGTERM`. |
 | `WEBHOOK_SECRETS is not set, and the worker does not send unsigned webhooks…`, and the worker exits | No webhook secret is configured. See [First-time setup](#first-time-setup). |
 | `The worker cannot start: the database schema is at revision 0003, and this version of the service needs 0004 or later…`, and the worker exits | The migrations have not been run. Run `uv run alembic upgrade head`, then start the worker again. |
@@ -151,7 +169,7 @@ Times are in the machine's local time. Other worker messages:
 `uv run python dev/demo.py` shows the guarantees with real processes. It needs PostgreSQL running,
 creates its own `webhooks_demo` database with two producers, carrental and friendster, and makes a
 webhook secret for the run. It then starts a test receiver, the API and a worker on free ports
-with short timeouts, and plays six scenes in about 25 seconds:
+with short timeouts, and plays seven scenes in about 35 seconds:
 
 | Scene | What happens | What it shows |
 |---|---|---|
@@ -161,6 +179,7 @@ with short timeouts, and plays six scenes in about 25 seconds:
 | 4 | The worker is killed with `SIGKILL` while it waits for the receiver. | The delivery stuck in `processing` until its claim expires, then `claim_expired` and delivery by a new worker. |
 | 5 | A request without a key; the same `Idempotency-Key` from both producers; friendster reading carrental's delivery; a 100 KB event. Then an attacker resends a captured webhook unchanged, with its body changed, with a new timestamp, and signed with a guessed secret. | `401`; two separate deliveries; `404`; `413`. The unchanged copy passes the signature check and is caught as a duplicate; the other three get `401`. |
 | 6 | A request freezes after storing an `Idempotency-Key`, without committing, and another request with that key arrives. Then a second API starts with a database it cannot reach, and a worker starts against a database without tables. | `503` after the 1-second lock timeout, while `/ready` stays `200`; PostgreSQL ends the frozen transaction after 3 idle seconds, and the key can be used. The second API answers `/health` with `200` and `/ready` with `503`. The worker exits at once, saying to run the migrations. |
+| 7 | The worker is stopped and three events are submitted. Then the receiver rejects an event, and an operator replays it with `webhook-admin`. | The API's metrics show 3 due deliveries, the oldest waiting 2 seconds, and 0 once a worker is back. The rejected delivery is `failed`; after the replay it is delivered as attempt 2, with the same `webhook-id`. The worker's metrics count every attempt. |
 
 It prints each step, the worker's and the receiver's log lines, and each delivery's attempt
 history. The demo database is emptied at the start of every run and left in place afterwards, so
@@ -170,7 +189,9 @@ you can look at it with `psql`.
 
 Start more `uv run webhook-worker` processes, on this machine or on others that can reach the same
 `DATABASE_URL`. Each worker claims different deliveries, and none waits for another. Give all
-workers the same settings.
+workers the same settings, except that workers on one machine each need their own
+`WORKER_METRICS_PORT`, or `0` for none. A worker whose port is taken warns and works without
+metrics.
 
 ### Stopping
 
@@ -201,6 +222,10 @@ Milestone 5.1 (version 0.5.1) added API keys and signatures, so two more steps c
 restart: set `WEBHOOK_SECRETS` for the workers and the receiver, and create a producer and an API
 key for each app that submits events. Until a producer sends its key, its requests get `401`.
 Deliveries stored before the upgrade belong to the producer `legacy`, and are still delivered.
+
+Milestone 5.3 (version 0.5.3) adds migration `0005`: a column that lets a replayed delivery start a
+new set of attempts, and an index for the purge. A 0.5.3 worker does not start until it has run.
+The new settings all have defaults, and the metrics listen on `127.0.0.1:8001` and `:8002`.
 
 ## 3. Submitting events
 
@@ -589,9 +614,9 @@ Because the ID and the work commit together, a crash can never leave one without
 copies can even arrive at the same moment, when a frozen worker's request and its replacement
 overlap. The same pattern handles that: the second insert waits for the first transaction, then
 inserts nothing. Keep IDs at least as long as the retry window, about 21 minutes with the default
-settings, and longer if operators may [replay](#replaying-a-failed-delivery) old deliveries.
-Keeping them for a few days is a safe choice. CarRental already does the same for Stripe events,
-with its `stripe_events` table.
+settings. An operator can [replay](#replaying-failed-deliveries) a failed delivery until it is
+purged, so if replays may happen, keep IDs as long as `RETENTION_DAYS`, 30 days by default.
+CarRental already does the same for Stripe events, with its `stripe_events` table.
 
 The same table stops replays. A captured webhook resent within the five minutes its timestamp
 allows passes the signature check, but its `webhook-id` has been processed already.
@@ -633,7 +658,7 @@ the duplicate check is part of verification, not an extra.
 
 Answer `401` when the check fails. The service treats it like any other 4xx: the delivery fails at
 once, without retries, because sending the same webhook again cannot fix secrets that do not
-match. Once they are fixed, [replay](#replaying-a-failed-delivery) the failed deliveries.
+match. Once they are fixed, [replay](#replaying-failed-deliveries) the failed deliveries.
 
 **In TypeScript,** with Node's built-in `crypto`:
 
@@ -886,6 +911,22 @@ The receiver got two requests with the same `webhook-id`, and processed only the
 the first answered `500` without processing. The whole delivery took 11.3 seconds, almost all of
 it the retry wait.
 
+### 6.7 After the final state
+
+A `delivered` or `failed` delivery stays as it is, with its history, until one of two operator
+commands changes it:
+
+- **Replay.** `webhook-admin replay` puts a `failed` delivery back to `pending`, due at once. It
+  keeps its ID, and so its `webhook-id`, and its history; the next attempt continues the
+  numbering. It also gets `MAX_ATTEMPTS` new attempts, with the retry waits starting again from
+  `RETRY_BASE_DELAY_SECONDS`. To do that, the replay sets `attempt_base` to the number of attempts
+  made so far, and the attempt limit and the retry delay count from it. Without it, a delivery
+  replayed after its eighth attempt would get a single attempt, and fail again at its first
+  error. See [Replaying failed deliveries](#replaying-failed-deliveries).
+- **Purge.** `webhook-admin purge` deletes deliveries that were delivered or failed more than
+  `RETENTION_DAYS` ago, with their attempts and their `Idempotency-Key`s. See
+  [Data retention](#data-retention).
+
 ## 7. Configuration reference
 
 Settings are read from environment variables, or from a `.env` file in the working directory.
@@ -908,6 +949,12 @@ Environment variables win. Copy `.env.example` to start.
 | `RETRY_MAX_DELAY_SECONDS` | `3600` | Worker | Longest wait between attempts, jitter included. |
 | `CLAIM_TIMEOUT_SECONDS` | `60` | Worker | How long a claim lasts. Must be at least 3 × `DELIVERY_TIMEOUT_SECONDS`, or the worker refuses to start. |
 | `POLL_INTERVAL_SECONDS` | `1` | Worker | How often an idle worker looks for due deliveries. |
+| `LOG_FORMAT` | `text` | API, worker | `text`: one readable line per event. `json`: one JSON object per line, with fields such as `delivery_id`, `request_id` and `outcome`, for a log collector. See [Logs](#logs). |
+| `LOG_LEVEL` | `INFO` | API, worker | `DEBUG` adds health checks; `INFO` logs every request and attempt; `WARNING` keeps only problems. |
+| `METRICS_HOST` | `127.0.0.1` | API, worker | The address the metrics ports listen on. Use a private address that Prometheus can reach, never a public one: the metrics have no authentication. |
+| `API_METRICS_PORT` | `8001` | API | The port of the API's `/metrics`; `0` turns them off. Never the API's own port: producers can reach that one, and the metrics name every producer. |
+| `WORKER_METRICS_PORT` | `8002` | Worker | The port of a worker's `/metrics`; `0` turns them off. Workers on one machine each need their own. |
+| `RETENTION_DAYS` | `30` | `webhook-admin purge` | How long a delivery is kept after it was delivered or failed. Longer than any producer may retry a request; see [Data retention](#data-retention). |
 | `TEST_DATABASE_URL` | `postgresql+psycopg://webhooks:webhooks@localhost:5433/webhooks_test` | Tests | Database for integration tests. It is created and migrated automatically. The tests delete all its data, so its name must end in `_test`, and it must not be the database `DATABASE_URL` names. |
 
 An invalid setting stops the API and the worker at startup. The message names the setting and the
@@ -930,6 +977,9 @@ Some guidance:
   timeout short: a request that waits for a lock holds a thread and a pooled connection all that
   time. The service's connections also send TCP keepalives, so a connection that died without a
   word fails within about 25 seconds; that is fixed in `db.py`.
+- **Retention:** longer than any producer may keep retrying a request, outbox backlogs included,
+  and as long as you want to look back on deliveries. Receivers that may get replays should
+  remember `webhook-id`s as long.
 
 ## 8. Operating the service
 
@@ -957,6 +1007,220 @@ Neither needs an API key. Keep `/health` free of the database: while the databas
 restarting the API would not bring it back. In a probe with the database stopped, `/health`
 answered `200` and `/ready` answered `503` within a few milliseconds, and `/ready` was `200`
 again as soon as the database was back.
+
+### Logs
+
+Both processes log to standard error, one line per event, for whatever runs them to collect: a
+terminal, `docker logs`, journald or a log shipper. Set `LOG_FORMAT=json` where logs are collected
+and searched, and keep `text` for reading in a terminal.
+
+With `LOG_FORMAT=json`, every line, Uvicorn's included, is a JSON object:
+
+```json
+{"time": "2026-11-25T22:18:03.743Z", "level": "info", "process": "api", "logger": "webhook_service.api", "message": "POST /deliveries 202 (30 ms, carrental)", "event": "request_finished", "method": "POST", "route": "/deliveries", "path": "/deliveries", "status": 202, "duration_ms": 30, "producer": "carrental", "request_id": "checkout-4711"}
+{"time": "2026-11-25T22:18:09.999Z", "level": "info", "process": "worker", "logger": "worker", "message": "dff54cf1-6154-4395-b683-5bd5353a85be attempt 1: delivered (HTTP 200, 1 ms)", "delivery_id": "dff54cf1-6154-4395-b683-5bd5353a85be", "attempt": 1, "producer": "carrental", "event_type": "booking.confirmed", "event": "attempt_finished", "outcome": "delivered", "http_status": 200, "error_category": null, "duration_ms": 1, "status": "delivered"}
+```
+
+`time` is in UTC. `message` is the text the text format shows; the other fields are for searching
+and counting. The service's events:
+
+| `event` | Process | Fields besides the message |
+|---|---|---|
+| `request_finished` | API | `method`, `route` (the template, such as `/deliveries/{delivery_id}`), `path`, `status`, `duration_ms`, `producer` (`null` without a valid key), `request_id` |
+| `delivery_stored`, `delivery_repeated` | API | `delivery_id`, `producer`, `event_type`, `idempotency_key`, `request_id` |
+| `storage_unavailable` | API | `reason`, `request_id`; the request then ends with `503` |
+| `attempt_finished` | Worker | `delivery_id`, `attempt`, `producer`, `event_type`, `outcome`, `http_status`, `error_category`, `duration_ms`, `status`, and `retry_in_seconds` when it will be retried |
+| `attempt_discarded` | Worker | `delivery_id`, `attempt`, `producer`, `event_type` |
+| `claim_expired` | Worker | `delivery_id`, `attempt`, `delivery_failed` |
+| `database_error`, `database_recovered` | Worker | `reason`, `failing_for_seconds` |
+| `unexpected_error` | Worker | `exception`, with the traceback |
+| `metrics_started`, `metrics_unavailable` | Both | `port` |
+| `worker_started`, `worker_stopping`, `worker_stopped` | Worker | `pid`, at the start |
+
+**Request IDs.** Every answer has an `X-Request-ID` header, and every line logged while handling
+the request carries it as `request_id`. A producer that sends its own `X-Request-ID`, such as the
+ID of its own job, gets it back and can find the API's lines by it. An ID longer than 128
+characters, or with characters other than letters, digits, `.`, `_`, `:` and `-`, is replaced
+with a new one, so that nobody can forge log lines through it.
+
+**Following one event.** The request ID leads to the delivery ID, and the delivery ID leads to
+every attempt, in the API's log and the workers':
+
+```bash
+jq -c 'select(.request_id == "checkout-4711") | {event, status, delivery_id}' api.log
+jq -c --arg id "$DELIVERY_ID" 'select(.delivery_id == $id) | {process, event, attempt, outcome}' api.log worker.log
+```
+
+```text
+{"event":"delivery_stored","status":null,"delivery_id":"ad133d97-783f-42d2-a509-e4e0a5fd9bc2"}
+{"event":"request_finished","status":202,"delivery_id":null}
+
+{"process":"api","event":"delivery_stored","attempt":null,"outcome":null}
+{"process":"worker","event":"attempt_finished","attempt":1,"outcome":"delivered"}
+```
+
+**What is never logged:** request and event bodies, API keys, webhook secrets and database
+passwords. A line names the producer, the event type and the IDs. They are enough to look a
+delivery up through the API or the database, where access is controlled and old rows are purged;
+logs are copied to more places, kept longer and read by more people.
+
+**Levels.** At `INFO`, the default, health checks answered under `400` are left out, because a load
+balancer asks every few seconds; `DEBUG` shows them. Answers with `5xx` are warnings. While the
+database is down, the worker logs the first error, a reminder once a minute and the recovery,
+rather than a line per poll.
+
+### Metrics
+
+Each process serves [Prometheus](https://prometheus.io) metrics at `/metrics`, on a port of its
+own:
+
+| Process | Address | Setting |
+|---|---|---|
+| API | `http://127.0.0.1:8001/metrics` | `API_METRICS_PORT` |
+| Worker | `http://127.0.0.1:8002/metrics` | `WORKER_METRICS_PORT` |
+
+They are never served on the API's own port. Producers can reach that port, and the metrics name
+every producer and count its events, which each producer should not see of the others. The ports
+listen on `127.0.0.1` unless `METRICS_HOST` says otherwise, and have no authentication, so expose
+them only on a private network. A minimal Prometheus configuration:
+
+```yaml
+scrape_configs:
+  - job_name: webhook-api
+    static_configs: [{targets: ["127.0.0.1:8001"]}]
+  - job_name: webhook-worker
+    static_configs: [{targets: ["127.0.0.1:8002"]}]   # one target per worker
+```
+
+With Docker Desktop, a Prometheus container reaches the ports at `host.docker.internal:8001` and
+`host.docker.internal:8002`; that is how the queries and alerts below were tested.
+
+**The queue,** from the API. At each scrape the API reads it from the database, with two small
+queries on partial indexes. It is the API's job rather than the workers' because a worker's own
+metrics disappear when the worker stops, which is exactly when the queue grows.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `webhooks_queue_oldest_due_seconds` | gauge | How long the oldest due delivery has waited for a worker; 0 when none is due. The best single sign of trouble. |
+| `webhooks_queue_due` | gauge | Deliveries due now: `pending` ones whose time has come, and `processing` ones whose claim expired. |
+| `webhooks_deliveries{status}` | gauge | Deliveries that are `pending` (due, or waiting for a retry), `processing` or `failed`. |
+| `webhooks_database_up` | gauge | 1 if the queue could be read, 0 if the database was unavailable or too busy. |
+
+**Requests,** from the API:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `webhooks_http_requests_total{method, route, status}` | counter | Answered requests. `route` is the route's template, such as `/deliveries/{delivery_id}`, or `none` for a request answered before it reached one: an unknown path, or a body refused by its `Content-Length`. |
+| `webhooks_http_request_duration_seconds{method, route}` | histogram | How long the API took to answer. |
+| `webhooks_submissions_total{producer, result}` | counter | Submissions per producer: `stored`, or `repeat` for a request answered with `Idempotent-Replayed`. |
+
+**Attempts,** from each worker. Each worker counts what it did since it started, and Prometheus
+adds them up across workers and restarts:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `webhooks_attempts_total{outcome, error_category}` | counter | Attempts that ended. `error_category` is `none` for a 2xx, or `timeout`, `connection_error`, `http_error` or `claim_expired`. An attempt whose worker stopped is counted, as `claim_expired`, by the worker that takes the delivery over. |
+| `webhooks_attempt_duration_seconds{outcome}` | histogram | Time until the receiver's status code arrived, or until the request failed. |
+| `webhooks_deliveries_finished_total{status}` | counter | Deliveries that became `delivered` or `failed`. |
+| `webhooks_delivery_latency_seconds` | histogram | From acceptance to delivery, for delivered deliveries: the delay the receiver sees. It compares the worker's clock with the database's, so keep their clocks in sync. |
+| `webhooks_results_discarded_total` | counter | Results not saved, because another worker had taken the delivery over. |
+| `webhooks_worker_errors_total{kind}` | counter | Errors in the worker's loop: `database` (unavailable, or a limit ran out) or `unexpected` (a bug). |
+
+Both processes also serve `webhooks_build_info{version}`, and the Python client's process
+metrics, such as memory use and open files.
+
+A worker's counters exist from its start, at 0, for every outcome, status and error kind.
+Prometheus cannot count the step from a series that does not exist yet to its first value, so a
+counter that appeared at 1 with the first failure would hide that failure from `increase()`, and
+from any alert built on it.
+
+Labels are deliberately few. A label with a value per delivery, such as its ID, would create a
+series per delivery and swamp Prometheus; IDs belong in the logs.
+
+Useful queries:
+
+```promql
+# Is anything late? Every API instance reports the same queue, so take the maximum.
+max(webhooks_queue_oldest_due_seconds)
+
+# The share of attempts that failed in the last 10 minutes, and why.
+sum(rate(webhooks_attempts_total{outcome!="delivered"}[10m])) / sum(rate(webhooks_attempts_total[10m]))
+sum by (outcome, error_category) (rate(webhooks_attempts_total[10m]))
+
+# Deliveries that failed in the last hour, and so may need a replay.
+sum(increase(webhooks_deliveries_finished_total{status="failed"}[1h]))
+
+# How long receivers wait for events: the 95th percentile.
+histogram_quantile(0.95, sum by (le) (rate(webhooks_delivery_latency_seconds_bucket[15m])))
+
+# Requests per route and status, and the API's 99th-percentile answer time.
+sum by (route, status) (rate(webhooks_http_requests_total[5m]))
+histogram_quantile(0.99, sum by (le, route) (rate(webhooks_http_request_duration_seconds_bucket[5m])))
+
+# Submissions per producer.
+sum by (producer, result) (increase(webhooks_submissions_total[1h]))
+```
+
+### Alerts
+
+Alert on symptoms that need a person, not on every possible cause. These rules were loaded into a
+real Prometheus scraping the service, and `promtool check rules` accepts them:
+
+```yaml
+groups:
+  - name: webhook-delivery
+    rules:
+      - alert: WebhookDeliveriesWaiting
+        expr: max(webhooks_queue_oldest_due_seconds) > 300
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "A due delivery has waited {{ $value | humanizeDuration }} for a worker."
+      - alert: WebhookDatabaseUnreadable
+        expr: webhooks_database_up == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }} cannot read the queue from the database."
+      - alert: WebhookTargetDown
+        expr: up{job=~"webhook-api|webhook-worker"} == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Prometheus cannot scrape {{ $labels.job }} at {{ $labels.instance }}."
+      - alert: WebhookAttemptsFailing
+        expr: |
+          sum(rate(webhooks_attempts_total{outcome!="delivered"}[10m]))
+            / sum(rate(webhooks_attempts_total[10m])) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Most attempts fail: is the receiver down or refusing webhooks?"
+      - alert: WebhookDeliveriesFailed
+        expr: sum(increase(webhooks_deliveries_finished_total{status="failed"}[1h])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Deliveries failed in the last hour. Find out why, then replay them."
+      - alert: WebhookWorkerBug
+        expr: sum(increase(webhooks_worker_errors_total{kind="unexpected"}[1h])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "The worker hit an unexpected error. Its log has the traceback."
+```
+
+- **`WebhookDeliveriesWaiting` is the one to page on.** It fires whatever the cause: no worker
+  running, workers stuck on the database, or too few workers for the load. Normally the oldest due
+  delivery waits less than `POLL_INTERVAL_SECONDS`. A delivery waiting for its retry is not due,
+  so a receiver outage alone does not fire it; `WebhookAttemptsFailing` covers that.
+- **`WebhookTargetDown`** notices a stopped process, whose own metrics vanish with it.
+- **`WebhookDeliveriesFailed` is a ticket, not a page.** Someone finds out why, fixes it, and
+  [replays](#replaying-failed-deliveries) the deliveries.
 
 ### Producers and API keys
 
@@ -1008,12 +1272,13 @@ webhooks that the receiver will trust. Workers sign every webhook with every sec
 
 No webhook fails at any step. If the receiver switches to the new secret before every worker signs
 with it, webhooks get `401` and fail at once. Give the workers both secrets, then
-[replay](#replaying-a-failed-delivery) the failed deliveries. The test receiver reads
+[replay](#replaying-failed-deliveries) the failed deliveries. The test receiver reads
 `WEBHOOK_SECRETS` too, so locally both sides change together.
 
 ### Checking health with SQL
 
-Connect with `docker compose exec db psql -U webhooks`.
+The metrics answer the usual questions, and SQL answers the rest. Connect with
+`docker compose exec db psql -U webhooks`.
 
 ```sql
 -- How many deliveries are in each state?
@@ -1026,7 +1291,7 @@ GROUP BY 1, 2 ORDER BY 1, 2;
 
 -- How far behind are the workers? The age of the oldest delivery that is due but not sent.
 SELECT now() - min(next_attempt_at) AS oldest_due_waiting
-FROM deliveries WHERE status = 'pending' AND next_attempt_at <= now();
+FROM deliveries WHERE status IN ('pending', 'processing') AND next_attempt_at <= now();
 
 -- What is being sent right now, and when do those claims expire?
 SELECT id, attempt_count, next_attempt_at AS claim_expires_at
@@ -1059,12 +1324,27 @@ WHERE datname = current_database()
 -- To end one: SELECT pg_terminate_backend(<pid>);
 ```
 
-The most useful single number is `oldest_due_waiting`. If it keeps growing, workers are missing,
-stuck or too few.
+The most useful single number is `oldest_due_waiting`, which the API reports as
+`webhooks_queue_oldest_due_seconds`. If it keeps growing, workers are missing, stuck or too few.
 
 The duplicate query lists deliveries where the service could not tell whether an attempt reached
 the receiver. A connection dropped after the request was sent is recorded as `connection_error`,
 so in rare cases it is another source of duplicates.
+
+The service's limits do not apply to your own `psql` session. Keep manual transactions short, or
+better, run single statements without `BEGIN`: while your transaction holds a row, the service's
+requests and workers that need it give up after `DATABASE_LOCK_TIMEOUT_SECONDS`. Running
+`SET lock_timeout = '2s';` first also keeps your statement from waiting behind the service.
+
+Change deliveries with `webhook-admin`, not by hand:
+
+- **Lowering `attempt_count`** makes the next claim reuse an attempt number. The database rejects
+  that, so every claim of that delivery fails. Workers log an `unexpected error` each time and
+  carry on, but the delivery stays first in line, so a single worker sends nothing else until the
+  row is fixed.
+- **Setting `processing`** without a claim token is rejected by the database.
+- **Setting a failed delivery back to `pending`** gives it only the attempts it had left, often a
+  single one. `webhook-admin replay` gives it a full set.
 
 ### Troubleshooting
 
@@ -1078,11 +1358,15 @@ so in rare cases it is another source of duplicates.
 | `alembic upgrade head` fails with `canceling statement due to lock timeout` | A long transaction is using a table the migration changes. Waiting would hold up every query on that table. | Run it again. If it keeps failing, find and end the long transaction first. |
 | Every request gets `401` | The API key is missing, mistyped or revoked, or was created in another database. | Run `uv run webhook-admin list` with the API's `DATABASE_URL`, and create a new key if needed. |
 | `POST` returns `413` | The event is larger than `MAX_EVENT_BYTES`. | Send less data, such as IDs, or raise the limit. |
-| Deliveries stay `pending`, and `oldest_due_waiting` grows | No worker is running, or workers cannot reach the database. | Start workers and read their logs. |
+| Deliveries stay `pending`, and `webhooks_queue_oldest_due_seconds` grows | No worker is running, or workers cannot reach the database. | Check `up` for the workers' targets, start workers, and read their logs. |
 | Many `connection_error` attempts | The receiver is down, or `RECEIVER_URL` is wrong. | Fix the receiver. Deliveries retry by themselves until `MAX_ATTEMPTS`. |
 | Many `timeout` attempts | The receiver is slow. | Make it answer before doing slow work. Raise the timeouts only if that is not possible. |
-| `permanent_failure` with a 4xx | The receiver rejects the event. | Fix the receiver or the producer, then replay. |
+| `permanent_failure` with a 4xx | The receiver rejects the event. | Fix the receiver or the producer, then [replay](#replaying-failed-deliveries). |
 | `permanent_failure` with `401` | The receiver refused the signature: it has none of the secrets the workers sign with. | Give both sides the same secret, as in [Rotating the webhook secret](#rotating-the-webhook-secret), then replay. |
+| `webhook-admin replay` says `not replayed, because they are not failed or do not exist` | The delivery is delivered, still being retried, already replayed or purged, or the ID is mistyped. | Check it with `GET /deliveries/{id}`. Only failed deliveries are replayed. |
+| A producer's repeated request got a new delivery instead of `Idempotent-Replayed` | The first delivery was purged, which freed its `Idempotency-Key`. | Raise `RETENTION_DAYS` above the producer's longest retry; see [Data retention](#data-retention). |
+| A process logs `metrics are off: cannot listen on …` | Another process has the port, often a second worker on the same machine. | Give each process its own port, or `0`. It works without metrics meanwhile, and Prometheus shows its target as down. |
+| `webhooks_database_up` is 0 | The API cannot read the queue: the database is down or too busy. | As for `503` answers; `/ready` reports the same. |
 | A delivery is `processing` for a long time | A worker is sending it, or crashed while doing so. | Wait `CLAIM_TIMEOUT_SECONDS`; another worker takes over by itself. |
 | `claim_expired` in a history | A worker crashed or froze mid-attempt. | Check that worker's health. The receiver may have a duplicate. |
 | A worker logs `unexpected error` with a traceback | A bug, or a row edited by hand. | Read the traceback. The worker carries on, and the delivery it held is sent again when its claim expires. |
@@ -1092,38 +1376,70 @@ so in rare cases it is another source of duplicates.
 | The worker exits at start: `WEBHOOK_SECRETS is not set` | No webhook secret is configured. | See [First-time setup](#first-time-setup). |
 | The worker exits at start: `The worker cannot start: the database schema is at revision …` or `the database has no tables yet` | The migrations have not been run on its database, or `DATABASE_URL` names another database. | Run `uv run alembic upgrade head` with the same `DATABASE_URL`. |
 
-### Replaying a failed delivery
+### Replaying failed deliveries
 
-There is no replay endpoint yet. After fixing the cause, put a failed delivery back in the queue
-with SQL:
+A delivery fails when the receiver rejects it, or stays down past every attempt. Once the cause is
+fixed, send the failed deliveries again:
 
-```sql
-UPDATE deliveries SET status = 'pending', next_attempt_at = now(), updated_at = now()
-WHERE id = '<delivery id>' AND status = 'failed';
+```bash
+uv run webhook-admin replay 4c1a7406-f4aa-4267-9eca-0d2827083bd1          # these deliveries
+uv run webhook-admin replay --failed-since 2026-11-25T20:00               # all that failed since then
+uv run webhook-admin replay --failed-since 2026-11-25T20:00 --producer carrental
 ```
 
-The next free worker sends it with the same `webhook-id`, and the history keeps the earlier
-attempts. `attempt_count` is not reset, so if it is already at `MAX_ATTEMPTS`, the delivery gets
-exactly one more attempt.
+```text
+Replayed 1 delivery. Workers send each again, with up to MAX_ATTEMPTS new attempts.
+  4c1a7406-f4aa-4267-9eca-0d2827083bd1
+```
 
-The service's limits do not apply to your own `psql` session. Keep manual transactions short, or
-better, run single statements without `BEGIN`: while your transaction holds a row, the service's
-requests and workers that need it give up after `DATABASE_LOCK_TIMEOUT_SECONDS`. Running
-`SET lock_timeout = '2s';` first also keeps your statement from waiting behind the service.
+- **Only `failed` deliveries are replayed.** One that is delivered, still being retried or
+  already replayed is left alone. If you named it, the command says so and exits with status 1.
+- **A time without a time zone is local time.** Write `2026-11-25T20:00+00:00` for UTC.
+- **It is the same delivery.** It keeps its ID, and so its `webhook-id`, and its history, and new
+  attempts continue the numbering. A receiver that processed it before, say when an answer was
+  lost, recognizes it as long as it still remembers the ID.
+- **It gets `MAX_ATTEMPTS` new attempts,** with the retry waits starting again from
+  `RETRY_BASE_DELAY_SECONDS`, so a receiver that is still unsteady has the whole schedule to
+  recover. See [After the final state](#67-after-the-final-state).
+- **Workers send it at once:** it is due as soon as it is replayed.
 
-Do not edit other columns by hand:
+In the demo, a delivery the receiver rejected with `400`, then replayed:
 
-- **Lowering `attempt_count`** makes the next claim reuse an attempt number. The database rejects
-  that, so every claim of that delivery fails. Workers log an `unexpected error` each time and
-  carry on, but the delivery stays first in line, so a single worker sends nothing else until the
-  row is fixed.
-- **Setting `processing`** without a claim token is rejected by the database.
+```text
+GET /deliveries/00546942: delivered
+  attempt 1  + 0.0 s  permanent_failure  HTTP 400
+  attempt 2  + 0.6 s  delivered          HTTP 200
+```
+
+Replaying is a command, not an API endpoint, for the same reason as `create-producer`: it works
+with database access, the operator's boundary, so the API needs no administrator credential.
+Replay many deliveries at once only if the receiver can take them: they are all due at once, and
+the workers send them as fast as they can.
 
 ### Data retention
 
-Nothing is deleted. Over time, `delivered` rows and their attempts accumulate. They are left out of
-the worker's index, so they do not slow down delivery. A cleanup job that deletes old finished
-deliveries (their attempts are deleted with them) is future work.
+Delivered and failed deliveries are kept, with their attempts, until they are purged:
+
+```bash
+uv run webhook-admin purge --dry-run   # Would delete 1250 deliveries that finished more than 30 days ago.
+uv run webhook-admin purge             # Deleted 1250 deliveries that finished more than 30 days ago, with their attempts.
+```
+
+The purge deletes deliveries that became `delivered` or `failed` more than `RETENTION_DAYS` ago,
+with their attempts. `pending` and `processing` deliveries are never deleted, however old. It
+deletes 1,000 at a time, each batch in a short transaction of its own, and skips any row another
+transaction holds, such as one being replayed at that moment, so it neither holds many locks for
+long nor waits for one. Run it once a day, from cron, a systemd timer or a Kubernetes CronJob.
+
+**Choose `RETENTION_DAYS` with producers' retries in mind.** A delivery's `Idempotency-Key` is
+deleted with it. If a producer then resends the request, for example from an outbox that was stuck
+for days, the service has forgotten the key: it stores a new delivery with a new `webhook-id`, and
+the receiver cannot tell it from a new event. So keep deliveries longer than any producer may
+retry. Receivers have a matching rule: a failed delivery can be replayed until it is purged, so a
+receiver that may get replays should remember `webhook-id`s for `RETENTION_DAYS` too.
+
+Retention is also how far back you can look: a purged delivery's history is gone, and
+`GET /deliveries/{id}` answers `404` for it.
 
 ## 9. Limitations
 
@@ -1131,9 +1447,12 @@ deliveries (their attempts are deleted with them) is future work.
 - No rate limit per producer: a producer with a valid key can submit as fast as the database
   accepts.
 - API keys do not expire, and the service does not record when a key was last used.
-- Idempotency keys never expire.
-- No metrics or structured logs yet; use the SQL queries above.
-- No replay endpoint and no cleanup of old rows.
+- An idempotency key lasts as long as its delivery: until the purge deletes it, if it has
+  finished.
+- Replaying and purging are commands that need database access, not API endpoints, and the
+  service does not schedule the purge itself.
+- The metrics have no authentication; they rely on listening on a private address.
+- `webhooks_delivery_latency_seconds` compares the worker's clock with the database's.
 - No deadline for a whole attempt: a receiver that sends its status line a few bytes at a time can
   outlast the claim, which causes a duplicate.
 - A database that freezes while its network stack keeps answering, as a paused container does,
@@ -1157,10 +1476,12 @@ Several of these are planned for the rest of milestone 5; see
 | Backoff | Waiting longer after each failure. |
 | Blocking session | A session holding a lock that another session waits for. `pg_blocking_pids` lists them. |
 | Bearer token | A credential sent as `Authorization: Bearer <token>`. Whoever holds it is let in, so it must stay secret. |
+| Cardinality | The number of series a metric has: one per combination of label values. A label with a value per delivery would make it grow without end. |
 | Claim | A worker's temporary, expiring ownership of a delivery. |
 | Claim token | The ID of the attempt holding the claim. Only the holder may save a result. In general this is called a fencing token. It guards the database, not the receiver. |
 | Claim timeout | How long a claim lasts. After that, another worker may take the delivery over; until one does, the original worker's result is still accepted. Message queues call this a visibility timeout. |
 | Constant-time comparison | Comparing two values in a time that does not depend on where they differ, so response times do not tell an attacker how close a guess is. |
+| Counter, gauge, histogram | Prometheus metric types. A counter only goes up, such as attempts made, and `rate()` or `increase()` reads it. A gauge goes up and down, such as the number of due deliveries. A histogram counts observations, such as durations, in buckets, from which percentiles are estimated. |
 | Fingerprint | A hash of a request's content, used to detect a key reused with different content. |
 | HMAC | A hash computed with a secret key. Only a holder of the key can compute it, so a matching HMAC proves who sent the content and that it did not change. |
 | Idempotency key | A producer-chosen name for a request, so that repeating it has no extra effect. |
@@ -1172,10 +1493,15 @@ Several of these are planned for the rest of milestone 5; see
 | Lock timeout | How long a statement may wait for a lock before PostgreSQL cancels it. |
 | Outbox | A table where a producer saves events in the same transaction as the change that caused them, for a relay to send later. |
 | Poison delivery | A delivery that fails or crashes every attempt. Attempt limits stop it. |
+| Purge | Deleting deliveries that finished more than `RETENTION_DAYS` ago, with `webhook-admin purge`. |
 | Readiness | Whether a process can serve requests now. A failed readiness check means: send traffic elsewhere, not restart. |
+| Replay (of a delivery) | Sending a failed delivery again, with `webhook-admin replay`. Not the same as a producer repeating a request, which the API answers with `Idempotent-Replayed`; the metrics call that a repeat. |
 | Replay attack | Resending a captured, genuine request. A signature alone does not stop it; the age check and the `webhook-id` check do. |
+| Request ID | The ID of one request to the API, in its `X-Request-ID` header and in every log line about it. |
+| Scrape | Prometheus reading a process's `/metrics` page, every few seconds. |
 | Secret rotation | Replacing a secret without downtime, by signing with, or accepting, both the old and the new one for a while. |
 | `SKIP LOCKED` | PostgreSQL's option to pass over rows another transaction has locked, instead of waiting. |
 | Statement timeout | How long one statement may run, lock waits included, before PostgreSQL cancels it. |
+| Structured log | A log whose lines are records with named fields, here JSON objects, rather than sentences alone. |
 | `webhook-id` | The delivery ID, sent with every attempt so that receivers can detect duplicates. |
 | Webhook secret | The `whsec_` secret that workers sign webhooks with and the receiver checks them with. |

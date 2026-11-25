@@ -1,9 +1,11 @@
 import json
+import logging
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import httpx2
 import pytest
@@ -27,6 +29,22 @@ SETTINGS = Settings(
     webhook_secrets=[signing.new_secret()],
 )
 CLAIM_OPTIONS = {"claim_timeout": timedelta(seconds=60), "max_attempts": 3}
+ATTEMPTS = "webhooks_attempts_total"
+WORKER_METRICS = {
+    "delivered": (ATTEMPTS, {"outcome": "delivered", "error_category": "none"}),
+    "retried": (ATTEMPTS, {"outcome": "retryable_failure", "error_category": "http_error"}),
+    "rejected": (ATTEMPTS, {"outcome": "permanent_failure", "error_category": "http_error"}),
+    "claim_expired": (
+        ATTEMPTS,
+        {"outcome": "retryable_failure", "error_category": "claim_expired"},
+    ),
+    "finished_delivered": ("webhooks_deliveries_finished_total", {"status": "delivered"}),
+    "finished_failed": ("webhooks_deliveries_finished_total", {"status": "failed"}),
+    "latency_observed": ("webhooks_delivery_latency_seconds_count", {}),
+    "discarded": ("webhooks_results_discarded_total", {}),
+    "database_errors": ("webhooks_worker_errors_total", {"kind": "database"}),
+    "unexpected_errors": ("webhooks_worker_errors_total", {"kind": "unexpected"}),
+}
 
 
 def fake_receiver(status_code: int) -> tuple[httpx2.Client, list[httpx2.Request]]:
@@ -334,11 +352,12 @@ def test_a_result_lost_with_the_database_is_recovered_by_sending_again(client, d
     assert [request.headers["webhook-id"] for request in sent] == [delivery_id, delivery_id]
 
 
-def test_an_unexpected_error_does_not_stop_the_worker(client, db, caplog):
+def test_an_unexpected_error_does_not_stop_the_worker(client, db, caplog, count_changes):
     broken = submit(client)
     healthy = submit(client)
     attempted: list[str] = []
     stop = threading.Event()
+    changes = count_changes(**WORKER_METRICS)
 
     def answer(request: httpx2.Request) -> httpx2.Response:
         attempted.append(request.headers["webhook-id"])
@@ -358,6 +377,13 @@ def test_an_unexpected_error_does_not_stop_the_worker(client, db, caplog):
 
     assert sorted(attempted) == sorted([broken, healthy])
     assert "unexpected error" in caplog.text
+    # The broken attempt is counted once its claim expires and another worker records it.
+    assert changes() == {
+        "unexpected_errors": 1,
+        "delivered": 1,
+        "finished_delivered": 1,
+        "latency_observed": 1,
+    }
     assert client.get(f"/deliveries/{healthy}").json()["status"] == "delivered"
     # The broken delivery keeps its claim until it expires, then it is sent again.
     broken_delivery = client.get(f"/deliveries/{broken}").json()
@@ -412,3 +438,177 @@ def test_a_worker_that_meets_a_lock_while_saving_a_result_gives_up_and_carries_o
     # claim expires.
     delivery = client.get(f"/deliveries/{delivery_id}").json()
     assert (delivery["status"], delivery["attempt_count"]) == ("processing", 1)
+
+
+def test_each_attempt_is_counted_and_logged_with_its_fields(client, db, count_changes, json_logs):
+    changes = count_changes(
+        **WORKER_METRICS,
+        timed=("webhooks_attempt_duration_seconds_count", {"outcome": "delivered"}),
+    )
+    delivery_ids = []
+    for status_code in (200, 503, 400):
+        delivery_ids.append(submit(client))
+        process_one(db, fake_receiver(status_code)[0], SETTINGS)
+
+    assert changes() == {
+        "delivered": 1,
+        "retried": 1,
+        "rejected": 1,
+        "finished_delivered": 1,
+        "finished_failed": 1,
+        "latency_observed": 1,
+        "timed": 1,
+    }
+    lines = [line for line in json_logs() if line.get("event") == "attempt_finished"]
+    assert [line["delivery_id"] for line in lines] == delivery_ids
+    delivered, retried, rejected = lines
+    assert (
+        delivered.items()
+        >= {
+            "attempt": 1,
+            "producer": "carrental",
+            "event_type": "booking.confirmed",
+            "outcome": "delivered",
+            "http_status": 200,
+            "error_category": None,
+            "status": "delivered",
+        }.items()
+    )
+    assert (
+        retried.items()
+        >= {
+            "outcome": "retryable_failure",
+            "http_status": 503,
+            "error_category": "http_error",
+            "status": "pending",
+        }.items()
+    )
+    assert 48 <= retried["retry_in_seconds"] <= 72  # 60 seconds, give or take 20%
+    assert (rejected["outcome"], rejected["status"]) == ("permanent_failure", "failed")
+    assert "retry_in_seconds" not in rejected
+
+
+def test_each_attempt_is_counted_once_even_when_its_result_is_discarded(
+    client, db, count_changes, caplog
+):
+    delivery_id = submit(client)
+
+    def answer_too_late(request: httpx2.Request) -> httpx2.Response:
+        # While worker A waits for this answer, its claim expires and worker B takes over.
+        make_due(db, delivery_id)
+        assert process_one(db, fake_receiver(200)[0], SETTINGS) is True
+        return httpx2.Response(200)
+
+    changes = count_changes(**WORKER_METRICS)
+    with httpx2.Client(transport=httpx2.MockTransport(answer_too_late)) as receiver:
+        assert process_one(db, receiver, SETTINGS) is True
+
+    # B counted attempt 1 as expired and attempt 2 as delivered. A's result was not saved.
+    assert changes() == {
+        "claim_expired": 1,
+        "delivered": 1,
+        "finished_delivered": 1,
+        "latency_observed": 1,
+        "discarded": 1,
+    }
+    assert caplog.messages == [
+        f"{delivery_id} attempt 1: the claim expired without a result, so the delivery is "
+        "sent again",
+        f"{delivery_id} attempt 1: result discarded; the claim expired and another worker "
+        "took the delivery over",
+    ]
+
+
+def test_a_worker_reports_each_expired_claim_it_finds(client, db, count_changes, caplog):
+    taken_over = submit(client)
+    claim(db)  # A worker claims it and stops.
+    make_due(db, taken_over)
+    changes = count_changes(**WORKER_METRICS)
+    receiver, _ = fake_receiver(200)
+
+    assert process_one(db, receiver, SETTINGS) is True
+
+    out_of_attempts = submit(client)
+    for _ in range(3):  # MAX_ATTEMPTS is 3, and every worker that claims it stops.
+        claim(db)
+        make_due(db, out_of_attempts)
+
+    assert process_one(db, receiver, SETTINGS) is False
+    assert client.get(f"/deliveries/{out_of_attempts}").json()["status"] == "failed"
+    assert changes() == {
+        "claim_expired": 2,
+        "delivered": 1,
+        "finished_delivered": 1,
+        "finished_failed": 1,
+        "latency_observed": 1,
+    }
+    assert caplog.messages == [
+        f"{taken_over} attempt 1: the claim expired without a result, so the delivery is "
+        "sent again",
+        f"{out_of_attempts} attempt 3: the claim expired without a result, and no attempts "
+        "are left: failed",
+    ]
+
+
+def test_database_errors_are_logged_when_they_start_every_minute_and_when_they_end(
+    monkeypatch, caplog, count_changes
+):
+    caplog.set_level(logging.INFO, logger="worker")
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    stop = threading.Event()
+
+    def database_down_for_a_while(engine, client, settings) -> bool:
+        clock.now += 25  # A poll every 25 seconds.
+        if clock.now <= 1100:
+            raise OperationalError("SELECT ...", {}, Exception("connection refused"))
+        stop.set()
+        return False
+
+    monkeypatch.setattr(worker, "process_one", database_down_for_a_while)
+    changes = count_changes(**WORKER_METRICS)
+
+    run(None, None, SETTINGS.model_copy(update={"poll_interval_seconds": 0.001}), stop)
+
+    # Four failed polls, but only the first and a reminder a minute later are logged.
+    assert changes() == {"database_errors": 4}
+    assert [(record.levelname, record.getMessage()) for record in caplog.records] == [
+        ("WARNING", "database error (connection refused), trying again every 0.001s"),
+        ("WARNING", "database errors for 75s, the latest: connection refused"),
+        ("INFO", "database working again after 100s"),
+    ]
+
+
+def test_a_replayed_delivery_gets_max_attempts_new_attempts(client, db):
+    delivery_id = submit(client)
+    receiver, sent = fake_receiver(503)
+    for _ in range(3):
+        make_due(db, delivery_id)
+        process_one(db, receiver, SETTINGS)
+    assert client.get(f"/deliveries/{delivery_id}").json()["status"] == "failed"
+
+    with Session(db) as session:
+        replayed = delivery_service.replay_failed(session, delivery_ids=[uuid.UUID(delivery_id)])
+
+    assert replayed == [uuid.UUID(delivery_id)]
+    claim(db)  # Attempt 4: the worker stops before saving a result.
+    make_due(db, delivery_id)
+    assert process_one(db, receiver, SETTINGS) is True  # Attempt 5: the receiver is still down.
+    # The second attempt since the replay waits 2 x 60 s, as a second attempt does, give or take
+    # 20%. Counted from the first attempt, it would wait 16 x 60 s.
+    assert timedelta(seconds=96) <= scheduled_delay(client, delivery_id) <= timedelta(seconds=144)
+    make_due(db, delivery_id)
+    assert process_one(db, receiver, SETTINGS) is True  # Attempt 6, the last.
+    make_due(db, delivery_id)
+    assert process_one(db, receiver, SETTINGS) is False
+    assert client.get(f"/deliveries/{delivery_id}").json()["status"] == "failed"
+    assert history(client, delivery_id) == [
+        (1, "retryable_failure", "http_error"),
+        (2, "retryable_failure", "http_error"),
+        (3, "retryable_failure", "http_error"),
+        (4, "retryable_failure", "claim_expired"),
+        (5, "retryable_failure", "http_error"),
+        (6, "retryable_failure", "http_error"),
+    ]
+    # The same event each time, so the receiver can recognize a copy it already processed.
+    assert {request.headers["webhook-id"] for request in sent} == {delivery_id}

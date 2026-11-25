@@ -7,6 +7,7 @@ of the database holds no usable keys, and a lost key cannot be recovered: create
 import hashlib
 import re
 import secrets
+import uuid
 from collections.abc import Sequence
 
 from sqlalchemy import func, select
@@ -75,6 +76,13 @@ def revoke_api_key(session: Session, prefix: str) -> None:
         raise ProducerError(f"Several active API keys start with {prefix}.")
     keys[0].revoked_at = func.now()
     session.commit()
+
+
+def producer_id(session: Session, name: str) -> uuid.UUID:
+    found = session.scalar(select(Producer.id).where(Producer.name == name))
+    if found is None:
+        raise ProducerError(f"There is no producer named {name}.")
+    return found
 
 
 def find_producer(session: Session, key: str) -> Producer | None:

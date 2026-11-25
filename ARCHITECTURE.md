@@ -16,6 +16,8 @@ the [user manual](docs/USER_MANUAL.md). To see how the design grew one guarantee
 - [Concurrency control](#concurrency-control)
 - [Retry policy](#retry-policy)
 - [Bounded waits](#bounded-waits)
+- [Observability](#observability)
+- [Operations: replay and retention](#operations-replay-and-retention)
 - [Security model](#security-model)
 - [Guarantees and failure modes](#guarantees-and-failure-modes)
 - [Design decisions](#design-decisions)
@@ -31,6 +33,8 @@ the [user manual](docs/USER_MANUAL.md). To see how the design grew one guarantee
   when a process dies at any moment.
 - Let only registered producers in, keep their deliveries apart, and let the receiver check that
   every webhook is genuine.
+- Show what the service is doing, and let an operator repair what failed, without reading its code
+  or its tables.
 - Keep the moving parts few: one codebase, one PostgreSQL database, two kinds of process.
 
 **Non-goals for now**
@@ -47,16 +51,19 @@ flowchart LR
     P[Producer app] -->|"POST /deliveries<br/>with an API key"| API[API process<br/>FastAPI]
     P -->|"GET /deliveries/:id"| API
     API -->|"INSERT and COMMIT"| DB[(PostgreSQL)]
-    O[Operator] -->|"webhook-admin"| DB
+    O[Operator] -->|"webhook-admin: producers,<br/>replay, purge"| DB
     W[Worker processes<br/>one or more] -->|"claim and record"| DB
     W -->|"signed POST /webhooks"| R[Receiver]
+    PR[Prometheus] -.->|"scrape :8001"| API
+    PR -.->|"scrape :8002"| W
 ```
 
 The API and the workers never call each other. The database is their only connection: the API
 writes deliveries, and the workers claim, send and update them. That is why each side can stop,
 restart or scale on its own. Both depend on PostgreSQL, which is the one shared point of failure.
-Operators register producers and their API keys with `webhook-admin`, which also works on the
-database directly.
+Operators register producers and their API keys, replay failed deliveries and purge old ones with
+`webhook-admin`, which works on the database directly. Prometheus scrapes each process's metrics on
+a port of its own; the API's include the queue, read from the database.
 
 ## Components
 
@@ -64,11 +71,13 @@ database directly.
 |---|---|---|
 | API: `main.py`, `api/deliveries.py`, `api/health.py` | Request validation, idempotent submission, reading deliveries, mapping errors to `409`, `422` and `503`, checking the settings at startup, liveness and readiness | Sending webhooks |
 | API guards: `api/dependencies.py`, `api/body_limit.py` | The producer behind the API key (`401` otherwise), and the body-size limit (`413`) | Deciding what a producer may see: the service layer filters by producer |
-| Service layer: `services/delivery_service.py` | Every delivery transaction: create, read, claim and record, each scoped to the producer where a producer is involved | HTTP on either side |
+| Service layer: `services/delivery_service.py` | Every delivery transaction: create, read, claim, record, replay and purge, each scoped to the producer where a producer is involved, and the snapshot of the queue for the metrics | HTTP on either side |
 | Producers: `services/producer_service.py` | Producers and API keys: create, hash, look up, revoke | Any delivery |
-| Admin command: `admin.py` | `webhook-admin`: producers, API keys and new webhook secrets | HTTP; it works on the database directly |
+| Admin command: `admin.py` | `webhook-admin`: producers, API keys, new webhook secrets, replaying failed deliveries and purging old ones | HTTP; it works on the database directly |
 | Database access: `db.py`, `schema.py` | The engine and the limits on every wait, sessions, telling an unavailable database from a bug, and the schema revision the code needs | Transactions, which the service layer owns |
-| Worker: `worker/main.py` | The loop (claim, send, record, wait), logging, clean stop on `SIGINT`/`SIGTERM`, waiting for the database and checking its schema at startup, carrying on through database outages and unexpected errors | Deciding what an attempt means: `sender.py` classifies it, `retry.py` sets the delay, and the service layer applies the attempt limit |
+| Worker: `worker/main.py` | The loop (claim, send, record, wait), its log lines and metrics, clean stop on `SIGINT`/`SIGTERM`, waiting for the database and checking its schema at startup, carrying on through database outages, logged once a minute, and unexpected errors | Deciding what an attempt means: `sender.py` classifies it, `retry.py` sets the delay, and the service layer applies the attempt limit |
+| Observability: `logs.py`, `metrics.py`, `api/observe.py`, `api/metrics.py`, `worker/metrics.py` | The text and JSON log formats and the request ID; the metrics servers; the middleware that gives each request an ID, a log line and metrics; the API's metrics, with the queue read from the database; the worker's metrics | Deciding what happened: they record what the API, the worker and the service layer report |
+| Server: `server.py` | `webhook-api`: Uvicorn, with the service's logging from the first line | The app itself, in `main.py` |
 | Sender: `sender.py` | One signed HTTP attempt, classified by the status code alone; the response body is never read | Database state |
 | Signing: `signing.py` | Standard Webhooks signatures: secrets, signing, and the verification receivers do | Where the secrets come from: `WEBHOOK_SECRETS` |
 | Retry policy: `retry.py` | The delay before the next attempt | Whether to retry at all, which depends on the outcome and the attempt limit |
@@ -85,6 +94,7 @@ flowchart TD
     WRK[worker/main.py] --> SCH
     DEP --> PRD[services/producer_service.py]
     ADM[admin.py] --> PRD
+    ADM --> SVC
     API --> SVC[services/delivery_service.py]
     WRK[worker/main.py] --> SVC
     WRK --> SND[sender.py]
@@ -124,6 +134,9 @@ Six rules keep the layers honest:
    lock waits and idle transactions, and every wait for a connection is bounded too. When a limit
    runs out, the API answers `503` and the worker tries again. See
    [Bounded waits](#bounded-waits).
+7. **Logs and metrics carry identifiers, never content.** No log line holds a request or event
+   body, an API key or a secret, and no metric label has a value per delivery. IDs go in the logs;
+   labels name routes, outcomes, statuses and producers. See [Observability](#observability).
 
 ## Data model
 
@@ -152,6 +165,7 @@ erDiagram
         jsonb payload
         varchar status
         int attempt_count
+        int attempt_base
         timestamptz next_attempt_at
         uuid claim_token
         varchar idempotency_key
@@ -213,13 +227,14 @@ can never disagree.
 | `payload` | The producer's `data` object, stored as JSONB. Key order and whitespace are not kept. |
 | `status` | `pending`, `processing`, `delivered` or `failed`. |
 | `attempt_count` | Attempts claimed so far, including any cut short before the request was sent. |
+| `attempt_base` | Attempts made before the last [replay](#replay); 0 if it was never replayed. The attempt limit and the retry delay count from it. |
 | `next_attempt_at` | While `pending`: when the delivery is due. While `processing`: when the current claim expires. Not meaningful once `delivered` or `failed`. |
 | `claim_token` | ID of the attempt that holds the claim. Set only while `processing`. |
 | `idempotency_key` | The producer's `Idempotency-Key`, if it sent one. Unique per producer. |
 | `request_fingerprint` | SHA-256 of the request's canonical JSON, to detect a key reused with different content. |
 | `last_http_status`, `last_error_category` | Result of the latest attempt whose worker saved it. An attempt closed as `claim_expired` by another worker does not change them. |
 | `created_at` | When the delivery was accepted. Sent as the body's `timestamp`. |
-| `updated_at` | When the row last changed. |
+| `updated_at` | When the row last changed. For a delivered or failed delivery, that is when it finished, which the purge and replays by failure time go by. |
 
 ### `delivery_attempts`
 
@@ -251,6 +266,7 @@ producer name follows the naming rule. The service layer keeps those, and the te
 | `ck_deliveries_status_valid` | `status` is one of the four states | The state machine cannot be corrupted. |
 | `ck_deliveries_claimed_while_processing` | `(status = 'processing') = (claim_token IS NOT NULL)` | Every in-flight delivery has exactly one owner, and no other row has one. |
 | `ck_deliveries_attempt_count_not_negative` | `attempt_count >= 0` | Sanity. |
+| `ck_deliveries_attempt_base_valid` | `attempt_base BETWEEN 0 AND attempt_count` | A replay can only start a new budget after attempts already made. |
 | `uq_deliveries_producer_id_idempotency_key` | `(producer_id, idempotency_key)` is unique; `NULL` keys are allowed | One delivery per key and producer. The basis of `ON CONFLICT`. Its index starts with `producer_id`, so it also serves lookups by producer. |
 | `fk_deliveries_producer_id_producers` | Every delivery belongs to an existing producer | A producer with deliveries cannot be deleted. |
 | `uq_producers_name` | Producer names are unique | Receivers tell producers apart by name. |
@@ -260,7 +276,8 @@ producer name follows the naming rule. The service layer keeps those, and the te
 | `ck_delivery_attempts_outcome_valid` | `outcome` is `NULL` or one of three values | Valid history. |
 | `ck_delivery_attempts_finished_with_outcome` | `(finished_at IS NULL) = (outcome IS NULL)` | An attempt is either running, or finished with an outcome. |
 | `uq_delivery_attempts_delivery_id` | `(delivery_id, number)` is unique | No two attempts share a number. Also indexes lookups by delivery. |
-| `ix_deliveries_due` | Index on `next_attempt_at` `WHERE status IN ('pending', 'processing')` | Serves the claim query. Finished deliveries, which become most rows over time, are left out. |
+| `ix_deliveries_due` | Index on `next_attempt_at` `WHERE status IN ('pending', 'processing')` | Serves the claim query and the queue metrics. Finished deliveries, which become most rows over time, are left out. |
+| `ix_deliveries_finished` | Index on `(status, updated_at)` `WHERE status IN ('delivered', 'failed')` | Serves the purge, replays by failure time and the count of failed deliveries, without scanning the table. |
 
 Migrations live in `alembic/versions`:
 
@@ -270,6 +287,7 @@ Migrations live in `alembic/versions`:
 | `0002` | Last-attempt columns and an index for due `pending` rows. |
 | `0003` | `delivery_attempts`, claim tokens, idempotency columns and the claim constraint. It also moves rows left in `processing` by the old, non-expiring claims back to `pending` before adding the constraint. |
 | `0004` | `producers`, `api_keys` and `deliveries.producer_id`, with idempotency keys unique per producer. Deliveries stored before it are given a producer named `legacy`, created only if there are any, before the column becomes required. |
+| `0005` | `deliveries.attempt_base` with its check, and the `ix_deliveries_finished` index. |
 
 CI runs `alembic upgrade head` and `alembic check`, so a model change without a migration fails the
 build. Migrations are numbered `0001`, `0002` and so on, and `schema.REQUIRED_REVISION` names the
@@ -288,8 +306,9 @@ stateDiagram-v2
     processing --> failed: retryable failure, no attempts left
     processing --> processing: claim expired, another worker takes over
     processing --> failed: claim expired, no attempts left
-    delivered --> [*]
-    failed --> [*]
+    failed --> pending: replayed by an operator
+    delivered --> [*]: purged after RETENTION_DAYS
+    failed --> [*]: purged after RETENTION_DAYS
 ```
 
 | Trigger | From | To | Guard | Writes |
@@ -297,12 +316,14 @@ stateDiagram-v2
 | `POST /deliveries` | none | `pending` | Valid request; the key is unused or was used with the same content | Insert the delivery. |
 | Claim | `pending` | `processing` | `next_attempt_at <= now()` and the row is not locked | `attempt_count + 1`, new attempt row, `claim_token` = attempt ID, `next_attempt_at = now() + CLAIM_TIMEOUT_SECONDS`. |
 | Claim (takeover) | `processing` | `processing` | The claim expired and attempts are left | Close the old attempt as `claim_expired`, then as above. |
-| Claim (exhausted) | `processing` | `failed` | The claim expired and `attempt_count >= MAX_ATTEMPTS` | Close the old attempt as `claim_expired`; clear `claim_token`. |
+| Claim (exhausted) | `processing` | `failed` | The claim expired and `attempt_count - attempt_base >= MAX_ATTEMPTS` | Close the old attempt as `claim_expired`; clear `claim_token`. |
 | Record a 2xx | `processing` | `delivered` | `claim_token` matches | Finish the attempt; clear `claim_token`. |
-| Record a retryable failure | `processing` | `pending` | `claim_token` matches and `attempt_count < MAX_ATTEMPTS` | Finish the attempt; `next_attempt_at = now() + backoff`. |
-| Record the last retryable failure | `processing` | `failed` | `claim_token` matches and `attempt_count >= MAX_ATTEMPTS` | Finish the attempt. |
+| Record a retryable failure | `processing` | `pending` | `claim_token` matches and `attempt_count - attempt_base < MAX_ATTEMPTS` | Finish the attempt; `next_attempt_at = now() + backoff`. |
+| Record the last retryable failure | `processing` | `failed` | `claim_token` matches and `attempt_count - attempt_base >= MAX_ATTEMPTS` | Finish the attempt. |
 | Record a permanent failure | `processing` | `failed` | `claim_token` matches | Finish the attempt. |
 | Late result from a stale worker | any | unchanged | `claim_token` does not match: another worker took the delivery over, or closed it | Nothing. |
+| Replay | `failed` | `pending` | An operator chose it, by ID or by failure time | `attempt_base = attempt_count`, `next_attempt_at = now()`. |
+| Purge | `delivered` or `failed` | deleted | `updated_at` is more than `RETENTION_DAYS` ago, and no other transaction holds the row | Delete the delivery; its attempts go with it. |
 
 Expiry and revocation are different things. When a claim expires, the delivery becomes claimable
 again, but the old worker's token stays valid until another worker actually takes the delivery
@@ -505,6 +526,9 @@ nominal = min(RETRY_MAX_DELAY_SECONDS, RETRY_BASE_DELAY_SECONDS × 2^(attempt �
 wait    = min(RETRY_MAX_DELAY_SECONDS, nominal × random(0.8, 1.2))
 ```
 
+`attempt` counts from the last replay, if any (`attempt_count - attempt_base`), so a replayed
+delivery starts the schedule again rather than waiting an hour between its first new attempts.
+
 The wait doubles so that brief blips are retried quickly while long outages are not hammered. The
 random factor spreads out deliveries that failed together, so a receiver coming back from an outage
 is not hit by all of them at the same moment. The second `min` keeps the random factor from
@@ -663,6 +687,126 @@ database itself.
 - The API does not refuse to start against an old schema. It must stay up to answer `/health`
   and `/ready`, and readiness keeps traffic away from it until the migrations have run.
 
+## Observability
+
+Three questions decide what the service records: is anything late, why did this delivery fail,
+and what happened to this one event? Metrics answer the first, across all deliveries; logs
+answer the other two, one delivery at a time.
+
+### Logs
+
+- One line per request and per attempt, to standard error, as text or JSON (`LOG_FORMAT`). A JSON
+  line carries the same message plus fields such as `delivery_id`, `attempt`, `outcome`,
+  `status`, `producer` and `request_id`. Python's standard `logging` and a small formatter do
+  this for the service's lines and Uvicorn's alike; no logging library is added.
+- Two IDs follow an event across the queue. The request ID covers one HTTP request, the delivery
+  ID the delivery's whole life, and the API's `delivery_stored` line carries both. A context
+  variable gives every line logged during a request its request ID, in FastAPI's thread pool too.
+- The request middleware runs outside every other one, so it also logs and counts the requests
+  that the body limit refuses before routing. Uvicorn's access log is off: it has no producer,
+  route or request ID. `webhook-api` sets up logging before Uvicorn starts, so with JSON even
+  Uvicorn's first lines are JSON.
+- A caller's `X-Request-ID` is used only if it is 1 to 128 letters, digits, `.`, `_`, `:` or `-`.
+  Anything else, such as a line break that could forge a log line, gets a new ID.
+- Bodies, API keys and secrets are never logged. Health checks are logged at `DEBUG`. During a
+  database outage the worker logs the first error, a reminder a minute and the recovery, while a
+  counter records every error: a line per poll would bury everything else.
+
+### Metrics
+
+- Each process serves Prometheus metrics on a port of its own, on `127.0.0.1` by default, and
+  never on the API's port: the metrics name every producer and count its events, and producers
+  can reach that port. A test checks that `/metrics` is `404` there.
+- A port that is taken does not stop the process. It logs a warning that names the setting and
+  runs without metrics, and Prometheus shows the target as down. Sending webhooks matters more.
+- The queue is measured in the API, from the database, by a collector that runs two indexed
+  queries at each scrape. A worker cannot report it: its metrics vanish when it stops, which is
+  when the queue grows. The collector's `describe()` lists its metric names, so that registering
+  it does not query the database, and a database error gives only `webhooks_database_up 0`.
+- `webhooks_queue_oldest_due_seconds` is the headline. It measures the promise itself, a delay,
+  whatever the cause. The number of due deliveries depends on traffic, and "a worker is down"
+  misses a worker that is up but stuck, while firing when the other workers cope.
+- Labels come from bounded sets: route templates, never paths; outcomes, statuses, error
+  categories and producer names; never delivery IDs.
+- A worker creates its labelled counters at 0 when it starts. Prometheus's `increase()` cannot
+  see the step from a missing series to its first value, so the first failure after a restart
+  would go uncounted, and an alert on it would not fire. With a real Prometheus, several failures
+  showed an increase of 1.5 before this change; after it, 3 failures showed 3.2, the extra being
+  Prometheus's extrapolation to the edges of the window.
+- Each attempt is counted once. A worker whose result is discarded counts a discard, not an
+  attempt: the worker that took the delivery over counted it, as `claim_expired`.
+- Delivery latency subtracts the database's `created_at` from the worker's clock, so the two
+  clocks must agree.
+
+## Operations: replay and retention
+
+### Replay
+
+`webhook-admin replay` moves failed deliveries back to `pending`, chosen by ID, or by failure time
+and optionally by producer, in one statement:
+
+```sql
+UPDATE deliveries
+SET status = 'pending', next_attempt_at = now(), attempt_base = attempt_count, updated_at = now()
+WHERE status = 'failed'
+  AND id IN (:ids)                    -- if IDs are given
+  AND updated_at >= :failed_since     -- if a time is given
+  AND producer_id = :producer_id      -- if a producer is given
+RETURNING id;
+```
+
+- **Only failed deliveries.** A `pending` or `processing` delivery is already being sent, so a
+  replay can never start a second claim or put a second copy in flight, and running the same
+  replay twice changes nothing the second time.
+- **The same delivery, and the same `webhook-id`.** A copy would get a new ID, and the receiver
+  could not tell it from a new event. Keeping the row also keeps the history in one place.
+- **A new budget without rewriting history.** `attempt_count` cannot go back: attempt numbers are
+  unique per delivery, so reusing one would break every claim. `attempt_base` records the
+  attempts made before the replay, and the attempt limit, in the claim and the record step, and
+  the retry delay count from it.
+- **Safe beside the purge.** The `UPDATE` locks its rows, which the purge skips. Once the replay
+  commits they are `pending`, and the purge never deletes those.
+- **A command, not an endpoint,** like `create-producer`: database access is the operator's
+  boundary, and an endpoint would need an administrator credential and widen the API.
+
+### Retention
+
+`webhook-admin purge` deletes deliveries that finished more than `RETENTION_DAYS` ago, a batch at
+a time:
+
+```sql
+DELETE FROM deliveries WHERE id IN (
+    SELECT id FROM deliveries
+    WHERE status IN ('delivered', 'failed') AND updated_at < now() - :retention
+    LIMIT 1000
+    FOR UPDATE SKIP LOCKED
+);
+COMMIT;  -- and again, until a batch deletes fewer than 1000
+```
+
+- **`updated_at` is the finish time.** A finished row changes only when a replay makes it
+  unfinished again. So the age counts from the finish, not from acceptance: a delivery accepted 40
+  days ago and delivered yesterday after a replay is kept.
+- **Short batches** keep the locks and the transaction of each delete small, so even a large first
+  purge holds 1,000 rows at a time, and each batch stays far inside the statement timeout.
+- **`SKIP LOCKED`** passes over a row another transaction holds, such as one being replayed,
+  instead of waiting for it.
+- **Attempts go with their delivery,** through the foreign key's `ON DELETE CASCADE`, in the same
+  statement.
+- **`ix_deliveries_finished`** finds the old finished rows without scanning the table.
+- **Deleting a delivery forgets its `Idempotency-Key`.** The key's uniqueness lives in the row, so
+  a producer that retries a purged request creates a new delivery with a new `webhook-id`, which no
+  receiver can recognize as a copy. Retention must outlast every producer's retries, and receivers
+  that may get replays must remember IDs for as long as retention. Each layer that drops duplicates
+  must remember longer than the layer before it may resend.
+- **A scheduled command rather than a thread in the worker:** it runs once and exits, its output
+  and exit status say what it did, and the worker loop stays simple.
+
+On a large table, migration `0005` would be written differently: the index built with
+`CREATE INDEX CONCURRENTLY`, outside a transaction, and the check added `NOT VALID` and validated
+separately, so that neither blocks writes for long. The tables here are small enough for the plain
+forms.
+
 ## Security model
 
 Trust crosses three boundaries, and each has its own proof:
@@ -686,7 +830,8 @@ flowchart LR
 | Worker to receiver | A captured webhook is sent again later | The signed timestamp and the receiver's age check; within the age limit, the signed `webhook-id` and the receiver's duplicate check |
 | Receiver to worker | An answer uses up, holds up or crashes the worker | Only the status code is read; see [Retry policy](#retry-policy) |
 | Database copies | A leaked copy gives access | Only key hashes are stored, and webhook secrets are not in the database |
-| Logs | Secrets end up in logs | Settings errors never repeat a value, and keys and secrets are never logged |
+| Logs | Secrets, or personal data in events, end up in logs | Bodies, API keys and secrets are never logged; settings errors never repeat a value; a caller's request ID is checked before it is logged |
+| Metrics | Producers learn each other's volumes from the metrics | Metrics on ports of their own, on `127.0.0.1` by default; `/metrics` is `404` on the API's port |
 
 ### Producer authentication
 
@@ -770,8 +915,10 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
 - **Public-key signatures.** With one receiver run by the same team, a shared secret is enough.
   For third-party receivers, the specification's asymmetric scheme (`v1a`) would mean no receiver
   holds a secret that can sign.
-- **Database access.** Whoever can write to the database can create keys. Database credentials
-  are the operator's boundary.
+- **Database access.** Whoever can write to the database can create keys, replay and purge.
+  Database credentials are the operator's boundary.
+- **Metrics authentication.** The metrics ports have none; they rely on listening on a private
+  address.
 
 ## Guarantees and failure modes
 
@@ -802,6 +949,8 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
 10. **Bounded waits.** Every wait on the database has a limit, with one exception: a query already
     sent to a database that freezes while its network stack keeps answering waits until it
     resumes.
+11. **Replays keep identity.** Only failed deliveries are replayed. A replayed delivery keeps its
+    `webhook-id` and its history, and gets a new set of attempts.
 
 | What fails | What happens | Result |
 |---|---|---|
@@ -842,6 +991,12 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
 | A setting is invalid | The API and the worker stop at startup, naming the setting but not its value | No secrets in logs, and no API that fails every request. |
 | An API key leaks | Revoke it; the next request with it gets `401` | Deliveries it submitted are kept and delivered. |
 | A webhook secret leaks | Rotate it, signing with both secrets for a while | No webhook fails during the rotation. |
+| Every worker is stopped | The API's metrics still report the queue, from the database | `webhooks_queue_oldest_due_seconds` grows, and the alert on it fires. |
+| Prometheus is down, or a metrics port is taken | Delivery goes on; a process whose port is taken logs a warning and runs without metrics | Gaps in the metrics, and `up` is 0 for that target. |
+| The database is down for minutes | The worker logs the first error, a reminder each minute and the recovery | A readable log, with every error counted in `webhooks_worker_errors_total`. |
+| Deliveries failed while the receiver was broken | An operator fixes it and replays them | They are delivered with their original `webhook-id`s and a new set of attempts. |
+| A producer retries a request after its delivery was purged | The key is unknown again, so a new delivery is stored | A copy that the receiver cannot recognize. `RETENTION_DAYS` must outlast producers' retries. |
+| A replay and a purge run at the same time | The purge skips the rows the replay holds | The replayed deliveries are `pending` afterwards, and are kept. |
 
 ## Design decisions
 
@@ -890,6 +1045,20 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
 | The session closes before the response is sent | FastAPI's default, after | A slow client would hold a pooled connection, and an open transaction with its locks. |
 | TCP keepalives and `TCP_USER_TIMEOUT` | The operating system's defaults | A connection that died without a word fails in about 25 seconds instead of minutes or hours. |
 | No deadline kept by the client on each query | Asynchronous database access with cancellation | Synchronous code is simpler. A frozen database is found by monitoring it. |
+| Metrics on ports of their own | `/metrics` on the API | The metrics name every producer, and producers can reach the API's port. |
+| The queue measured in the API, from the database | Queue gauges in the worker | A worker's metrics vanish with it, which is when the queue grows. |
+| The oldest due delivery's age as the main alert | The queue's length, or "a worker is down" | Age measures the promise, a delay, whatever the cause; length depends on traffic. |
+| Labelled counters created at 0 at start | Created at their first increment | `increase()` cannot count the step from a missing series, so the first failure after a restart would be lost. |
+| Python's `logging` with a JSON formatter | structlog or python-json-logger | One small formatter covers the service's lines and Uvicorn's, with no new dependency. |
+| IDs in logs, never bodies | Logging request and event bodies | Bodies hold personal data and can be large, and logs are copied widely and kept long. The IDs find the data where access is controlled. |
+| Route templates as metric labels | Paths | A path holds a delivery ID, which would make a series per delivery. |
+| A log line for the start and end of a database outage, and one a minute | A line per poll | A line a second buries everything else; a counter keeps the exact number. |
+| `webhook-admin replay` and `purge` | API endpoints | No administrator credential to protect, and nothing more exposed over HTTP. |
+| Replay with `attempt_base` | Reset `attempt_count`, or copy the delivery | Attempt numbers stay unique, the history stays in one row, and the `webhook-id` stays the same. |
+| Replay only failed deliveries | Any delivery | A pending or processing delivery is already being sent, and resending a delivered one would be a different feature. |
+| Purge in batches with `SKIP LOCKED` | One `DELETE` | Short transactions and few locks at a time, and no waiting for a replay. |
+| Purge as a scheduled command | A thread in the worker | It runs once and exits, with output and an exit status, and the worker stays simple. |
+| No distributed tracing | OpenTelemetry | Two IDs connect the API and the worker. A trace across the queue would need its context stored in each row; a candidate for later. |
 | One configured destination | Destinations chosen by producers | Avoids server-side request forgery. Arbitrary destinations need URL validation, redirect rules and per-destination credentials. |
 | Synchronous code | `async` throughout | Simpler to reason about and test. Throughput comes from running more workers. |
 | HTTPX2 | HTTPX | The maintained continuation of HTTPX, by Pydantic, with the same API. |
@@ -899,8 +1068,9 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
 
 - **Unit tests** need no database: attempt classification, the webhook headers, body and
   signature, retry delays and the hard cap, configuration checks, the migration numbering, both
-  `503` answers, liveness and readiness with an unreachable database, and a worker waiting for
-  one.
+  `503` answers, liveness and readiness with an unreachable database, a worker waiting for one,
+  the text and JSON log formats, the metrics server on a free and on a taken port, and the
+  counters of a newly started worker.
 - **Signature tests** reproduce the Standard Webhooks reference signature, and check that
   verification refuses a changed body or ID, another secret, an old or future timestamp, a
   refreshed timestamp, and a missing signature; that a webhook signed with two secrets verifies
@@ -947,16 +1117,31 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
   classification both ways, the session's scope, readiness without the schema check and when
   storage is down, an exact-match schema check, a stale required revision, the worker's startup
   check, its waiting for the database and its error logging, the migration lock timeout, and the
-  settings rule.
+  settings rule. Milestone 5.3 added thirty more: the replay budget in the claim, in the record
+  step and in the retry delay; resetting it; replaying only failed deliveries; the time and
+  producer filters; the purge's status filter, its age cutoff, its batching and `SKIP LOCKED`; the
+  queue's due count; the request-ID check; probes at `DEBUG`; metrics on the API's port; the
+  middleware's order; the collector's error handling; telling stored from repeated submissions;
+  the outage log's throttling and its recovery line; reporting both kinds of expired claim;
+  counting a discarded result, and not counting it twice; the latency histogram; reading a time
+  without a zone as local time; the replay command's exit status; surviving a taken port; the JSON
+  fields; and the counters created at start.
+- **Observability tests** read the JSON log lines and the metrics' values before and after an
+  action, because the metrics are global to the test process: a request's fields and request ID,
+  that no line holds an API key or event data, counts by route template, the queue read from real
+  rows and from an unreachable database, each attempt counted once, and the outage log over a
+  simulated clock.
+- **Prometheus** was run outside the suite, scraping a live API and worker: every query and alert
+  rule in the user manual was evaluated against it, and `promtool` accepts the rules.
 - **Interoperability** was checked outside the suite: the specification's Python and JavaScript
   libraries, and the TypeScript and Python examples in the user manual, accept the service's
   webhooks and refuse tampered ones.
 - **Failure probes** were run outside the suite, against a throwaway PostgreSQL container: a
   stopped, a paused and a disconnected database, with a real API and worker, or with a client in
   a container on the same network. Their results are in [Bounded waits](#bounded-waits).
-- **A demo**, `dev/demo.py`, runs the real processes, kills a real worker and freezes a
-  transaction. It is a
-  demonstration rather than a CI test, because it depends on timing.
+- **A demo**, `dev/demo.py`, runs the real processes, kills a real worker, freezes a
+  transaction, and replays a rejected delivery while reading the metrics. It is a demonstration
+  rather than a CI test, because it depends on timing.
 - **CI** (GitHub Actions) runs Ruff, the format check, `alembic upgrade head`, `alembic check`
   and the whole test suite against a PostgreSQL service container.
 
@@ -964,18 +1149,21 @@ webhook-signature: v1,<signature> v1,<signature with the next secret> ...
 
 Planned for the rest of milestone 5:
 
-- **5.3, observability and operations:** structured logs; metrics such as the age of the oldest
-  due delivery, the retry rate and failures; an operator endpoint to replay failed deliveries;
-  and a retention job, which must keep deliveries longer than producers may retry, because
-  deleting a delivery frees its idempotency key.
 - **5.4, deployment:** a container image with API and worker entry points, migrations as a
   deploy step that is retried when it gives up on a lock, a shutdown grace period longer than an
-  attempt, a limit on concurrent requests at the server, backups, a runbook, and static type
-  checking in CI.
+  attempt, a limit on concurrent requests at the server, backups, a runbook, static type checking
+  in CI, and Prometheus with the alert rules and a scheduled purge in the deployment.
 
 Known gaps:
 
-- Idempotency keys never expire, and old rows are never cleaned up.
+- An idempotency key lasts as long as its delivery, so `RETENTION_DAYS` must outlast producers'
+  retries; nothing checks that it does.
+- The service does not schedule the purge; a scheduler must run `webhook-admin purge`.
+- The metrics ports have no authentication, and a failure between a worker's start and its first
+  scrape is in the first sample, so `increase()` misses it.
+- One API process per metrics port: running Uvicorn with several worker processes would need the
+  Prometheus client's multiprocess mode.
+- No distributed tracing; the request ID and the delivery ID connect the logs.
 - No rate limit per producer, no expiry for API keys, and no record of a key's last use.
 - One receiver, with one set of webhook secrets for every producer.
 - There is no deadline for a whole attempt. `DELIVERY_TIMEOUT_SECONDS` limits each network step,

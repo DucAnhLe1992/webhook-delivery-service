@@ -1,12 +1,16 @@
+import logging
 import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Header, HTTPException, Response, status
 
 from webhook_service.api.dependencies import ProducerDep, SessionDep
+from webhook_service.api.metrics import SUBMISSIONS
 from webhook_service.domain import DeliveryStatus
 from webhook_service.schemas import DeliveryAccepted, DeliveryDetail, DeliveryRequest
 from webhook_service.services import delivery_service
+
+log = logging.getLogger("webhook_service.api")
 
 router = APIRouter(
     prefix="/deliveries",
@@ -59,6 +63,21 @@ def submit_delivery(
             status.HTTP_409_CONFLICT,
             detail="This Idempotency-Key was already used for a different request",
         ) from None
+    SUBMISSIONS.labels(producer.name, "stored" if created else "repeat").inc()
+    log.info(
+        "%s delivery %s, %s from %s",
+        "stored" if created else "repeated request for",
+        delivery.id,
+        delivery.event_type,
+        producer.name,
+        extra={
+            "event": "delivery_stored" if created else "delivery_repeated",
+            "delivery_id": str(delivery.id),
+            "producer": producer.name,
+            "event_type": delivery.event_type,
+            "idempotency_key": idempotency_key,
+        },
+    )
     response.headers["Location"] = f"/deliveries/{delivery.id}"
     if not created:
         response.headers["Idempotent-Replayed"] = "true"

@@ -19,6 +19,9 @@ from webhook_service.worker import main as worker
 
 ROOT = Path(__file__).resolve().parents[2]
 EVENT = {"event_type": "booking.confirmed", "data": {"booking_id": 42}}
+# The test database is migrated to the newest revision, which is the one the code requires.
+CURRENT = schema.REQUIRED_REVISION
+OLDER, NEWER = (f"{int(CURRENT) + step:04d}" for step in (-1, 1))
 
 
 LOCK_PRODUCER = text("SELECT 1 FROM producers WHERE id = :id FOR UPDATE")
@@ -128,7 +131,7 @@ def test_a_request_holds_no_connection_while_its_response_is_sent(client, db, ap
 
 @pytest.mark.parametrize(
     ("required", "ready"),
-    [("0003", True), ("0004", True), ("0005", False)],
+    [(OLDER, True), (CURRENT, True), (NEWER, False)],
     ids=["code-older-than-database", "same", "code-newer-than-database"],
 )
 def test_the_api_is_ready_unless_its_code_is_newer_than_the_database(
@@ -145,8 +148,8 @@ def test_the_api_is_ready_unless_its_code_is_newer_than_the_database(
         assert response.status_code == 503
         assert response.json() == {
             "status": "not ready",
-            "detail": "the database schema is at revision 0004, and this version of the service "
-            "needs 0005 or later. Run `uv run alembic upgrade head`.",
+            "detail": f"the database schema is at revision {CURRENT}, and this version of the "
+            f"service needs {NEWER} or later. Run `uv run alembic upgrade head`.",
         }
 
 
@@ -162,14 +165,16 @@ def test_a_database_without_tables_is_reported(engine):
 
 
 def test_the_worker_does_not_start_when_its_code_is_newer_than_the_database(db, monkeypatch):
-    settings = Settings(_env_file=None, webhook_secrets=[signing.new_secret()])
-    monkeypatch.setattr(schema, "REQUIRED_REVISION", "0005")
+    settings = Settings(
+        _env_file=None, webhook_secrets=[signing.new_secret()], worker_metrics_port=0
+    )
+    monkeypatch.setattr(schema, "REQUIRED_REVISION", NEWER)
     monkeypatch.setattr(worker, "get_settings", lambda: settings)
     monkeypatch.setattr(worker, "get_engine", lambda: db)
     monkeypatch.setattr(worker.signal, "signal", lambda *args: None)
     monkeypatch.setattr(worker, "run", lambda *args: pytest.fail("the worker started"))
 
-    with pytest.raises(SystemExit, match="needs 0005 or later"):
+    with pytest.raises(SystemExit, match=f"needs {NEWER} or later"):
         worker.main()
 
 
@@ -205,7 +210,7 @@ def test_a_migration_waiting_for_a_lock_gives_up_instead_of_holding_up_every_que
 
         command.upgrade(config, "head")  # Run again once the reader is done.
 
-        assert revision() == "0004"
+        assert revision() == CURRENT
     finally:
         pool.shutdown(wait=False)
         database.dispose()

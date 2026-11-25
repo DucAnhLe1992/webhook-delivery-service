@@ -93,6 +93,16 @@ def short_limits_engine(db: Engine) -> Iterator[Engine]:
 
 
 @pytest.fixture
+def unreachable_engine() -> Iterator[Engine]:
+    """An engine for a database server that is not running: every connection is refused."""
+    engine = create_db_engine(
+        TEST_DATABASE_URL.set(host="127.0.0.1", port=1), Settings(_env_file=None)
+    )
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture
 def db(engine: Engine) -> Engine:
     """The test database, emptied before each test."""
     with engine.begin() as connection:

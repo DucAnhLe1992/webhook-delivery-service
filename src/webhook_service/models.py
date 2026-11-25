@@ -77,6 +77,7 @@ class Delivery(Base):
         ),
         CheckConstraint(one_of("status", DeliveryStatus), name="status_valid"),
         CheckConstraint("attempt_count >= 0", name="attempt_count_not_negative"),
+        CheckConstraint("attempt_base BETWEEN 0 AND attempt_count", name="attempt_base_valid"),
         # A delivery is processing exactly when one of its attempts holds the claim.
         CheckConstraint(
             "(status = 'processing') = (claim_token IS NOT NULL)", name="claimed_while_processing"
@@ -87,6 +88,14 @@ class Delivery(Base):
             "next_attempt_at",
             postgresql_where=text("status IN ('pending', 'processing')"),
         ),
+        # Serves the retention purge, replays of what failed since a given time, and the count
+        # of failed deliveries. For a finished delivery, updated_at is when it finished.
+        Index(
+            "ix_deliveries_finished",
+            "status",
+            "updated_at",
+            postgresql_where=text("status IN ('delivered', 'failed')"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -95,6 +104,9 @@ class Delivery(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(String(20), server_default=DeliveryStatus.PENDING)
     attempt_count: Mapped[int] = mapped_column(server_default="0")
+    # The attempts made before the last replay. A replayed delivery gets MAX_ATTEMPTS attempts
+    # again, counted from here.
+    attempt_base: Mapped[int] = mapped_column(server_default="0")
     # When a worker may next claim the delivery. While pending: when it is due. While
     # processing: when the current claim expires, so another worker can take over.
     next_attempt_at: Mapped[datetime] = mapped_column(

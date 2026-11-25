@@ -5,7 +5,7 @@
 PostgreSQL must be running (docker compose up -d --wait). The demo uses its own database,
 webhooks_demo, with two producers, carrental and friendster. It starts the test receiver,
 the API and a worker on free ports, with a webhook secret made for the run. Short timeouts
-keep it to about half a minute. It plays six scenes:
+keep it to about a minute. It plays seven scenes:
 
 1. A request repeated with the same Idempotency-Key is stored once.
 2. While the receiver is down, the worker retries with growing waits.
@@ -16,6 +16,8 @@ keep it to about half a minute. It plays six scenes:
 6. A request stuck behind a frozen transaction gives up quickly, and PostgreSQL ends the frozen
    transaction. An API whose database is unreachable is alive but not ready, and a worker does
    not start against a database without tables.
+7. The API's metrics show the queue growing while no worker runs. A delivery the receiver
+   rejected is replayed with webhook-admin, and the worker's metrics count every attempt.
 """
 
 import os
@@ -159,6 +161,7 @@ class Demo:
     def __init__(self, database_url: URL, api_keys: dict[str, str], log_dir: Path) -> None:
         self.database_url, self.log_dir = database_url, log_dir
         receiver_port, api_port = free_port(), free_port()
+        self.api_metrics_port, self.worker_metrics_port = free_port(), free_port()
         # The worker signs with this secret, and the receiver checks signatures with it.
         self.secret = signing.new_secret()
         env = {
@@ -168,6 +171,9 @@ class Demo:
             "DATABASE_URL": database_url.render_as_string(hide_password=False),
             "RECEIVER_URL": f"http://127.0.0.1:{receiver_port}/webhooks",
             "WEBHOOK_SECRETS": self.secret,
+            # Metrics are off, except for the processes given a port of their own below.
+            "API_METRICS_PORT": "0",
+            "WORKER_METRICS_PORT": "0",
         }
         self.env = env
         python = sys.executable
@@ -180,13 +186,20 @@ class Demo:
         )
         self.api = Process(
             "api",
-            [python, "-m", "uvicorn", "webhook_service.main:app", "--port", str(api_port)],
-            env,
+            [python, "-m", "webhook_service.server", "--port", str(api_port)],
+            env | {"API_METRICS_PORT": str(self.api_metrics_port)},
             log_dir,
         )
         worker = [python, "-m", "webhook_service.worker.main"]
-        self.worker = Process("worker", worker, env, log_dir)
-        self.worker_2 = Process("worker-2", worker, env, log_dir)
+        self.worker = Process(
+            "worker", worker, env | {"WORKER_METRICS_PORT": str(free_port())}, log_dir
+        )
+        self.worker_2 = Process(
+            "worker-2",
+            worker,
+            env | {"WORKER_METRICS_PORT": str(self.worker_metrics_port)},
+            log_dir,
+        )
         self.processes = [self.receiver, self.api, self.worker, self.worker_2]
         api_url = f"http://127.0.0.1:{api_port}"
         # Scenes 1 to 4 submit as carrental.
@@ -258,6 +271,29 @@ class Demo:
     def times_received(self, delivery_id: str) -> int:
         received = self.receiver_client.get("/received").json()
         return received.get(delivery_id, {}).get("count", 0)
+
+    def show_metrics(self, port: int, *prefixes: str, nonzero: bool = False) -> None:
+        """Print the lines of a process's /metrics page that start with one of the prefixes."""
+        page = httpx2.get(f"http://127.0.0.1:{port}/metrics", timeout=5).text
+        for line in page.splitlines():
+            if line.startswith(prefixes) and not (nonzero and line.endswith(" 0.0")):
+                print(f"    {line}")
+
+    def admin(self, *args: str) -> None:
+        """Run webhook-admin on the demo database, as an operator would, and show its output."""
+        result = subprocess.run(
+            [str(Path(sys.executable).with_name("webhook-admin")), *args],
+            cwd=ROOT,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        print(f"    $ webhook-admin {short(' '.join(args))}")
+        for line in (result.stdout + result.stderr).splitlines():
+            print(f"    {short(line)}")
+        if result.returncode != 0:
+            raise DemoError(f"webhook-admin {args[0]} exited with code {result.returncode}.")
 
     def show_history(self, delivery_id: str) -> None:
         delivery = self.delivery(delivery_id)
@@ -508,7 +544,7 @@ class Demo:
         api_port = free_port()
         api_2 = Process(
             "api-2",
-            [sys.executable, "-m", "uvicorn", "webhook_service.main:app", "--port", str(api_port)],
+            [sys.executable, "-m", "webhook_service.server", "--port", str(api_port)],
             self.env | {"DATABASE_URL": UNREACHABLE_DATABASE},
             self.log_dir,
         )
@@ -542,6 +578,61 @@ class Demo:
         exit_code = worker_3.popen.wait(timeout=30)
         last_line = worker_3.log_path.read_text().strip().splitlines()[-1]
         print(f"    worker-3 exits with code {exit_code}: {last_line}")
+
+    def scene_7(self) -> None:
+        print("\nScene 7: watching the service, and repairing what failed")
+        say(
+            "Each process serves Prometheus metrics on a port of its own. The API also reads the "
+            "queue from the database at each scrape, so the queue stays visible when no worker "
+            "runs, which is when it grows."
+        )
+        queue = ("webhooks_queue_due ", "webhooks_queue_oldest_due_seconds ")
+        self.worker_2.stop()
+        self.note("Stopped the worker.")
+        delivery_ids = [
+            self.submit(f"demo-booking-7-{n}", booking_id=70 + n).json()["delivery_id"]
+            for n in range(3)
+        ]
+        time.sleep(2)
+        self.note("Submitted 3 events and waited 2 seconds. The API's metrics:")
+        self.show_metrics(self.api_metrics_port, *queue)
+        say(
+            "An alert on how long the oldest delivery has waited fires whatever the cause: no "
+            "worker, a slow receiver, or too few workers for the load."
+        )
+        self.worker_2.start()
+        self.note("Started the worker again.")
+        for delivery_id in delivery_ids:
+            self.wait_until_delivered(delivery_id)
+        self.show_metrics(self.api_metrics_port, *queue)
+
+        say(
+            "Now the receiver has a bug: it rejects the next event with 400. The worker does not "
+            "retry a 4xx, because sending the same event again would get the same answer."
+        )
+        self.set_receiver_mode("reject")
+        delivery_id = self.submit("demo-booking-8", booking_id=8).json()["delivery_id"]
+        self.wait_until(
+            "the delivery has failed", lambda: self.delivery(delivery_id)["status"] == "failed"
+        )
+        self.show_logs()
+        self.show_metrics(self.api_metrics_port, 'webhooks_deliveries{status="failed"}')
+        self.set_receiver_mode("ok")
+        self.note("The receiver's team fixes the bug, and an operator sends the delivery again:")
+        self.admin("replay", delivery_id)
+        self.wait_until_delivered(delivery_id)
+        self.show_history(delivery_id)
+        say(
+            "It is the same delivery, with the same webhook-id, and its history keeps the "
+            "rejected attempt. The replay gave it MAX_ATTEMPTS new attempts, and it needed one. "
+            "Since it started again, the worker counted:"
+        )
+        self.show_metrics(
+            self.worker_metrics_port,
+            "webhooks_attempts_total{",
+            "webhooks_deliveries_finished_total{",
+            nonzero=True,
+        )
 
     def freeze_a_request(self, key: str) -> tuple[Engine, Connection]:
         """Store a delivery with the key and leave its transaction open, as a frozen request.
@@ -594,6 +685,7 @@ def main() -> None:
         demo.scene_4()
         demo.scene_5()
         demo.scene_6()
+        demo.scene_7()
         failed = False
     except DemoError as error:
         print(f"\n{error} The process logs are in {log_dir}.")

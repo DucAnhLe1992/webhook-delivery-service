@@ -52,6 +52,13 @@ error.
   get the API restarted for nothing, while `/ready` checks the database and its schema revision.
   A worker waits for a database that is down, and refuses to start against one whose migrations
   have not run.
+- **Observable, and repairable.** Structured JSON logs follow each event from the producer's
+  request ID to every attempt, without ever logging a body or a key. Prometheus metrics, on
+  ports producers cannot reach, include how long the oldest due delivery has waited, read from
+  the database so that it shows even when every worker is down, and the manual has alert rules
+  tested against a real Prometheus.
+  Operators replay failed deliveries with their original `webhook-id` and a fresh set of
+  attempts, and purge old ones in small batches.
 
 ## How it works
 
@@ -61,6 +68,8 @@ flowchart LR
     API -->|"INSERT and COMMIT, then 202"| DB[(PostgreSQL)]
     W[Workers] -->|"claim, then record"| DB
     W -->|"signed POST with webhook-id"| R[Receiver]
+    M[Prometheus] -.->|"scrape /metrics"| API
+    M -.->|"scrape /metrics"| W
 ```
 
 1. The **API** checks the producer's API key, validates the event, stores it as a `pending`
@@ -70,7 +79,7 @@ flowchart LR
 3. The worker signs the webhook, sends it with no transaction open, and reads only the status
    code.
 4. It saves the result only if it still holds the claim. The delivery becomes `delivered`, goes
-   back to `pending` with a growing delay, or becomes `failed`.
+   back to `pending` with a growing delay, or becomes `failed`, which an operator can replay.
 
 The API and the workers never call each other; PostgreSQL is their only connection. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the data model, state machine, locking and design
@@ -91,9 +100,9 @@ API_KEY=$(uv run webhook-admin create-producer carrental)   # printed once, so k
 Start each process in its own terminal:
 
 ```bash
-uv run python dev/receiver.py                      # a test receiver on :9000
-uv run uvicorn webhook_service.main:app --reload   # the API on :8000
-uv run webhook-worker                              # a worker; start more to share the work
+uv run python dev/receiver.py   # a test receiver on :9000
+uv run webhook-api --reload     # the API on :8000, its metrics on :8001
+uv run webhook-worker           # a worker, its metrics on :8002; start more to share the work
 ```
 
 Submit an event:
@@ -115,16 +124,17 @@ location: /deliveries/73731487-6839-4966-b9b2-9b2a1a83054c
 
 Then follow it with `curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8000/deliveries/<delivery_id>`,
 which shows its status and every attempt. The test receiver logs each webhook after checking its
-signature. `curl http://127.0.0.1:8000/ready` tells whether the API can serve requests, and
-interactive API docs are at http://127.0.0.1:8000/docs.
+signature. `curl http://127.0.0.1:8000/ready` tells whether the API can serve requests,
+`curl -s http://127.0.0.1:8001/metrics | grep webhooks_queue` shows the queue, and interactive
+API docs are at http://127.0.0.1:8000/docs. Set `LOG_FORMAT=json` for JSON logs.
 
 ### See the guarantees in action
 
 `uv run python dev/demo.py` starts its own receiver, API and worker against a separate
-`webhooks_demo` database and plays six scenes in about 25 seconds: a repeated request, a receiver
-that is down, an answer that comes too late, a worker killed in the middle of a delivery, two
-producers and an attacker testing the trust checks, and a frozen transaction meeting the limits.
-Three of them, shortened:
+`webhooks_demo` database and plays seven scenes in about 35 seconds: a repeated request, a
+receiver that is down, an answer that comes too late, a worker killed in the middle of a
+delivery, two producers and an attacker testing the trust checks, a frozen transaction meeting the
+limits, and a backlog and a replay seen through the metrics. Four of them, shortened:
 
 ```text
 Scene 4: a worker dies in the middle of a delivery
@@ -162,6 +172,23 @@ Scene 6: every wait has a limit
   Second API, GET /health       -> 200 ok
   Second API, GET /ready        -> 503 not ready: the database is unavailable or too busy
     worker-3 exits with code 1: The worker cannot start: the database has no tables yet. Run `uv run alembic upgrade head`.
+
+Scene 7: watching the service, and repairing what failed
+  Stopped the worker.
+  Submitted 3 events and waited 2 seconds. The API's metrics:
+    webhooks_queue_due 3.0
+    webhooks_queue_oldest_due_seconds 2.055072
+  ...
+    00:14:16  receiver  00546942 -> 400 (mode=reject, not processed)
+    00:14:16  worker-2  00546942 attempt 1: failed permanently (HTTP 400)
+    webhooks_deliveries{status="failed"} 1.0
+  The receiver's team fixes the bug, and an operator sends the delivery again:
+    $ webhook-admin replay 00546942
+    Replayed 1 delivery. Workers send each again, with up to MAX_ATTEMPTS new attempts.
+    00:14:17  worker-2  00546942 attempt 2: delivered (HTTP 200, 1 ms)
+  GET /deliveries/00546942: delivered
+    attempt 1  + 0.0 s  permanent_failure  HTTP 400
+    attempt 2  + 0.6 s  delivered          HTTP 200
 ```
 
 ## API
@@ -174,6 +201,9 @@ Both `/deliveries` endpoints need the producer's API key, as `Authorization: Bea
 | `GET /deliveries/{id}` | `200` with the status and every attempt, `401` missing or invalid API key, `404` unknown ID or another producer's delivery, `422` malformed ID, `503` storage unavailable or too busy |
 | `GET /health` | Liveness: `200` while the API process is up. It does not use the database. |
 | `GET /ready` | Readiness: `200` when the database can be reached and its schema is recent enough, `503` with the reason otherwise |
+
+Every answer carries an `X-Request-ID` header: the caller's own, if it sent a usable one, or a new
+one. Every log line about the request carries it too.
 
 The receiver gets one `POST` per attempt:
 
@@ -226,11 +256,14 @@ how receivers should answer and drop duplicates.
 9. **Bounded waits:** every wait on the database has a limit, and running out of one gives a
    `503` or a retry, never a hang. The one exception, a query already sent to a database that
    freezes while its network keeps answering, is documented.
+10. **Replays keep identity:** only failed deliveries are replayed, and a replayed delivery keeps
+    its `webhook-id` and its history, with a new set of attempts.
 
 How each failure is handled, from a crashed API to a frozen worker, is listed in
 [ARCHITECTURE.md](ARCHITECTURE.md#guarantees-and-failure-modes), and what the security model does
 and does not cover in [its security section](ARCHITECTURE.md#security-model). Every wait and its
-limit are in [Bounded waits](ARCHITECTURE.md#bounded-waits).
+limit are in [Bounded waits](ARCHITECTURE.md#bounded-waits), and what is logged and measured, and
+why, in [Observability](ARCHITECTURE.md#observability).
 
 ## Configuration
 
@@ -253,6 +286,11 @@ Set environment variables, or copy `.env.example` to `.env`.
 | `RETRY_MAX_DELAY_SECONDS` | `3600` | Longest wait between attempts, jitter included. |
 | `CLAIM_TIMEOUT_SECONDS` | `60` | How long a claim lasts. Must be at least 3 × `DELIVERY_TIMEOUT_SECONDS`. |
 | `POLL_INTERVAL_SECONDS` | `1` | How often an idle worker looks for due deliveries. |
+| `LOG_FORMAT` | `text` | `text` for people, or `json`: one object per line, with fields such as `delivery_id` and `request_id`. |
+| `LOG_LEVEL` | `INFO` | `DEBUG` adds health checks; `WARNING` keeps only problems. |
+| `METRICS_HOST` | `127.0.0.1` | The address the metrics ports listen on. They have no authentication, so keep it private. |
+| `API_METRICS_PORT`, `WORKER_METRICS_PORT` | `8001`, `8002` | Ports for `/metrics`, never the API's own; `0` turns them off. Workers on one machine each need their own. |
+| `RETENTION_DAYS` | `30` | How long `webhook-admin purge` keeps finished deliveries. Longer than any producer retries, because a purged delivery's `Idempotency-Key` is free again. |
 
 ## Development
 
@@ -262,7 +300,7 @@ uv run pytest              # all tests; integration tests need PostgreSQL
 uv run pytest tests/unit   # only the tests that need no database
 uv run ruff check .        # lint
 uv run ruff format .       # format
-uv run python dev/demo.py  # the six scenes, with real processes
+uv run python dev/demo.py  # the seven scenes, with real processes
 ```
 
 Integration tests create a `webhooks_test` database on the same server, run the real
@@ -286,24 +324,30 @@ service.
 
 ```text
 src/webhook_service/
-  main.py                       API app, settings check at startup, 503 when storage is down
+  main.py                       API app: settings check, logging and metrics at startup, 503 when storage is down
+  server.py                     the webhook-api command: Uvicorn with the service's logging
+  logs.py                       text and JSON log formats, and the request ID in every line
+  metrics.py                    the metrics server, on a port of its own
   config.py                     settings from the environment, never echoed in errors
   db.py                         database engine with a limit on every wait, sessions
   schema.py                     the schema revision the code needs, and the check for it
   domain.py                     delivery states and attempt outcomes, shared by every layer
   models.py                     producers, api_keys, deliveries and delivery_attempts tables
   schemas.py                    request, response and webhook message models
-  services/delivery_service.py  create (idempotent), read, claim and record; owns the transactions
+  services/delivery_service.py  create (idempotent), read, claim, record, replay and purge; owns the transactions
   services/producer_service.py  producers and API keys: create, hash, look up, revoke
   api/dependencies.py           the database session and the producer behind the API key
   api/body_limit.py             413 for bodies over MAX_EVENT_BYTES, before they are read
+  api/observe.py                a request ID, a log line and metrics for every request
+  api/metrics.py                the API's metrics, and the queue read from the database
   api/deliveries.py             POST and GET /deliveries, scoped to the producer
   api/health.py                 /health for liveness and /ready for readiness
   worker/main.py                the worker loop: wait for the database, then claim, send, record
+  worker/metrics.py             the worker's metrics: attempts, outcomes, latency, errors
   sender.py                     signs and sends one attempt, classifies it by status code
   signing.py                    Standard Webhooks signatures: sign, verify, secrets
   retry.py                      growing, capped, randomized retry delays
-  admin.py                      the webhook-admin command for producers, keys and secrets
+  admin.py                      webhook-admin: producers, keys, secrets, replay and purge
 alembic/versions/               database migrations
 dev/receiver.py                 test receiver that checks signatures; ok / slow / error / reject
 dev/demo.py                     scripted demonstration with real processes
@@ -316,13 +360,13 @@ docs/                           user manual and build history
 
 | Document | What it covers |
 |---|---|
-| [User manual](docs/USER_MANUAL.md) | Running the service, submitting and tracking events, receiving webhooks, how a delivery flows step by step, configuration, operating and troubleshooting. |
-| [Architecture](ARCHITECTURE.md) | Components, data model, state machine, sequence diagrams, locking, retry policy, bounded waits, security model, failure modes and design decisions. |
+| [User manual](docs/USER_MANUAL.md) | Running the service, submitting and tracking events, receiving webhooks, how a delivery flows step by step, configuration, logs, metrics and alerts, replaying, retention and troubleshooting. |
+| [Architecture](ARCHITECTURE.md) | Components, data model, state machine, sequence diagrams, locking, retry policy, bounded waits, observability, replay and retention, security model, failure modes and design decisions. |
 | [How it was built](docs/MILESTONES.md) | The milestones, the experiments that motivated each one, and what they taught. |
 
 ## Status
 
-Milestones 1 to 5.2 are done, and each is tagged (`milestone-1` to `milestone-5.2`).
+Milestones 1 to 5.3 are done, and each is tagged (`milestone-1` to `milestone-5.3`).
 
 - [x] **1. Send it now.** Direct delivery during the request, to learn what can go wrong.
 - [x] **2. Store before acknowledging.** `202` only after commit, `503` otherwise.
@@ -338,12 +382,15 @@ Milestones 1 to 5.2 are done, and each is tagged (`milestone-1` to `milestone-5.
 - [x] **5.2. Bounded waits.** A limit on every database wait, including migrations' lock waits; a
   session that closes before the response is sent; TCP keepalives; `/ready` next to `/health`;
   and a worker that waits for the database and checks its schema at startup.
-- [ ] **5.3. Observability and operations.** Structured logs, metrics, a replay endpoint and a
-  retention job.
+- [x] **5.3. Observability and operations.** Structured logs with request and delivery IDs;
+  Prometheus metrics on separate ports, with the queue's age read from the database; tested alert
+  rules; replaying failed deliveries with a fresh set of attempts; and purging old ones in
+  batches.
 - [ ] **5.4. Deployment.** Container images, migrations as a deploy step, a shutdown grace period,
   a limit on concurrent requests, backups and a runbook.
 
-Known limitations: one receiver with one set of secrets, no rate limits, API keys and idempotency
-keys that never expire, old rows kept forever, no hard deadline for a whole attempt, no limit yet
-on a query already sent to a frozen database, and no ordering guarantee. Destinations chosen by
-producers and a dashboard are not planned.
+Known limitations: one receiver with one set of secrets, no rate limits, API keys that never
+expire, idempotency keys that last only as long as their delivery, no hard deadline for a whole
+attempt, no limit yet on a query already sent to a frozen database, metrics without
+authentication, and no ordering guarantee. Destinations chosen by producers and a dashboard are
+not planned.

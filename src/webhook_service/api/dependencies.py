@@ -2,7 +2,7 @@
 
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -30,6 +30,7 @@ def unauthorized(detail: str) -> HTTPException:
 def authenticate(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
     session: SessionDep,
+    request: Request,
 ) -> Producer:
     """The producer whose API key the request carries. Any other request gets 401."""
     if credentials is None:
@@ -39,6 +40,8 @@ def authenticate(
     if producer is None:
         # The same answer for unknown and revoked keys: a caller cannot tell which keys existed.
         raise unauthorized("Invalid API key")
+    # For the request's log line and metrics, which name the producer.
+    request.state.producer = producer.name
     return producer
 
 

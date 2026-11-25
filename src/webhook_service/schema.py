@@ -4,7 +4,7 @@ from sqlalchemy import Connection, text
 
 # The newest migration this code needs. A test checks that it is the newest file in
 # alembic/versions, so a migration cannot be added without updating it.
-REQUIRED_REVISION = "0004"
+REQUIRED_REVISION = "0005"
 
 
 def schema_problem(connection: Connection) -> str | None:
